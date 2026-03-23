@@ -938,44 +938,8 @@ export default function MangaDiffDetector() {
   }, [readFilesFromPaths, isAcceptedFile, getAcceptedExtensions, loadJsonFile, getDropZoneFromPosition, handleParallelTauriDrop]);
 
   // ウィンドウ閉じ時の未保存チェック
-  useEffect(() => {
-    const setupCloseGuard = async () => {
-      const appWindow = getCurrentWebviewWindow();
-      return await appWindow.onCloseRequested(async (event) => {
-        event.preventDefault();
-        try {
-          if (!textVerifyHasUnsavedRef.current) {
-            await appWindow.destroy();
-            return;
-          }
-          if (textVerifyMemoFilePathRef.current) {
-            // ファイルから読み込んだメモ → 保存可能
-            const save = await ask('テキストメモに未保存の変更があります。保存しますか？', {
-              title: 'KENBAN', kind: 'warning', okLabel: '保存して閉じる', cancelLabel: '保存しない',
-            });
-            if (save) await saveTextVerifyMemoRef.current();
-            await appWindow.destroy();
-          } else {
-            // クリップボード貼り付けメモ → 保存先なし、確認のみ
-            const ok = await ask('テキストメモに未保存の変更があります。閉じますか？', {
-              title: 'KENBAN', kind: 'warning', okLabel: '閉じる', cancelLabel: 'キャンセル',
-            });
-            if (!ok) {
-              event.preventDefault();
-            } else {
-              await appWindow.destroy();
-            }
-          }
-        } catch (err) {
-          console.error('Close guard error (allowing close):', err);
-          await appWindow.destroy();
-        }
-        await appWindow.destroy();
-      });
-    };
-    const p = setupCloseGuard();
-    return () => { p.then(fn => fn()); };
-  }, []);
+  // COMIC-Bridge統合時は無効化（タブとして埋め込まれているため、ウィンドウクローズをブロックしない）
+  // 元のKENBAN単独アプリではonCloseRequestedで未保存確認を行っていた
 
   // DataTransferItemからファイルを再帰的に取得（ブラウザ用フォールバック）
   const getAllFilesFromDataTransfer = useCallback(async (dataTransfer: DataTransfer) => {
