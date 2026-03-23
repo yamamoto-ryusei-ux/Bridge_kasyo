@@ -314,7 +314,7 @@
 ### 17. 写植確認（TypesettingConfirmPanel）
 - **概要**: comicpotテキストデータにフォント指定を付与して保存する機能。フォント帳（プリセットJSON）を読み込み、テキストブロックにフォントを割り当て
 - **コンポーネント**: `TypesettingConfirmPanel.tsx`（`src/components/typesetting-confirm/`）
-- **テキスト解析**: `parseComicPotText()` でページ区切り `<<NPage>>` とブロック（空行区切り）を解析
+- **テキスト解析**: `parseComicPotText()` でページ区切り `<<NPage>>` および `[NP]` 形式とブロック（空行区切り）を解析
 - **テキスト保存**: `serializeText()` でフォント指定タグ付きテキストに変換
 - **フォント指定書式**: `[font:PostScriptName(表示名(カテゴリ))]` — subNameなし時は `[font:PostScriptName(表示名)]`
 - **sanitize処理**: フォント名・カテゴリ名から括弧文字（半角`()`・全角`（）`・角括弧`[]`）を除去して書式破壊を防止

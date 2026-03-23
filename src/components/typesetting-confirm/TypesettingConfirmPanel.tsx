@@ -113,7 +113,7 @@ function parseComicPotText(content: string): { header: string[]; pages: TextPage
   const header: string[] = [];
   const pages: TextPage[] = [];
   let currentPage: TextPage | null = null;
-  const pageRegex = /^<<(\d+)Page>>$/;
+  const pageRegex = /^(?:<<(\d+)Page>>|\[(\d+)P\])$/;
 
   let blockLines: string[] = [];
   let blockIndex = 0;
@@ -136,7 +136,7 @@ function parseComicPotText(content: string): { header: string[]; pages: TextPage
       flushBlock();
       blockIndex = 0;
       blockLines = [];
-      currentPage = { pageNumber: parseInt(match[1], 10), blocks: [] };
+      currentPage = { pageNumber: parseInt(match[1] || match[2], 10), blocks: [] };
       pages.push(currentPage);
     } else if (currentPage) {
       if (line.trim() === "") {
