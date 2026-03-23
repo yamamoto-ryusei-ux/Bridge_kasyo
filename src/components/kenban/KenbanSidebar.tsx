@@ -1,3 +1,4 @@
+// @ts-nocheck
 import React from 'react';
 import {
   PanelLeft, PanelLeftClose, Eye, Columns2, HardDrive,

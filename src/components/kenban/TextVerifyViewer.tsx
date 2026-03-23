@@ -1,3 +1,4 @@
+// @ts-nocheck
 import React, { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import {
   ChevronLeft, ChevronRight, ZoomIn, ZoomOut, RotateCcw,

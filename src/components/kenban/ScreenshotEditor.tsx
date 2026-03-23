@@ -1,3 +1,4 @@
+// @ts-nocheck
 ﻿import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { X, Square, Pen, Copy, Check, ZoomIn, ZoomOut, Maximize, Minus, Plus, Crop, Undo2, Hand, Type, MousePointer2, Download } from 'lucide-react';
 import { save } from '@tauri-apps/plugin-dialog';

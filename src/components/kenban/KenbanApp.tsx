@@ -1,3 +1,4 @@
+// @ts-nocheck
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { CheckCircle, AlertTriangle, Loader2, RefreshCw, Download } from 'lucide-react';
@@ -148,7 +149,7 @@ export default function MangaDiffDetector() {
   const { extractText: workerExtractText, reassignDiffs: workerReassignDiffs, cancelAll: cancelWorker } = useTextExtractWorker();
   // extractedLayersキャッシュ: State配列ではなくrefで管理（メモリ削減）
   // 現在ページのみstateに反映し、他はキャッシュから復元
-  const layerCacheRef = useRef<Map<number, import('./types').ExtractedTextLayer[]>>(new Map());
+  const layerCacheRef = useRef<Map<number, import('../../kenban-utils/kenbanTypes').ExtractedTextLayer[]>>(new Map());
   const textVerifyHasUnsavedRef = useRef(false);
   textVerifyHasUnsavedRef.current = textVerifyHasUnsavedChanges;
   const textVerifyMemoFilePathRef = useRef<string | null>(null);

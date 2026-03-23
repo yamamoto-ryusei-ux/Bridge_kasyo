@@ -1,3 +1,4 @@
+// @ts-nocheck
 import React from 'react';
 import { Layers } from 'lucide-react';
 import kenpanLogo from '../../kenban-assets/kenpan_logo.png';

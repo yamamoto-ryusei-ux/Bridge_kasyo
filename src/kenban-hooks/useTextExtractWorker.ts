@@ -2,7 +2,7 @@
 // PSD テキスト抽出 + diff 計算を Worker スレッドで実行する
 
 import { useRef, useCallback, useEffect } from 'react';
-import type { ExtractRequest, ReassignRequest, WorkerResponse } from '../workers/textExtractWorker';
+import type { ExtractRequest, ReassignRequest, WorkerResponse } from '../kenban-workers/textExtractWorker';
 import type { ExtractedTextLayer, DiffPart } from '../kenban-utils/kenbanTypes';
 
 export interface WorkerExtractResult {
@@ -29,7 +29,7 @@ const WORKER_TIMEOUT_MS = 120_000; // 2分
 
 function createWorker(): Worker {
   return new Worker(
-    new URL('../workers/textExtractWorker.ts', import.meta.url),
+    new URL('../kenban-workers/textExtractWorker.ts', import.meta.url),
     { type: 'module' },
   );
 }
