@@ -1,0 +1,4089 @@
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { createPortal } from 'react-dom';
+import { CheckCircle, AlertTriangle, Loader2, RefreshCw, Download } from 'lucide-react';
+import { pdfCache, checkPdfFileSize, globalOptimizeProgress, setOptimizeProgressCallback } from '../../kenban-utils/pdf';
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { readFile as tauriReadFile, readDir } from '@tauri-apps/plugin-fs';
+import { invoke, convertFileSrc } from '@tauri-apps/api/core';
+import { open, ask } from '@tauri-apps/plugin-dialog';
+import { check } from '@tauri-apps/plugin-updater';
+import { relaunch } from '@tauri-apps/plugin-process';
+import GDriveFolderBrowser from './GDriveFolderBrowser';
+import ScreenshotEditor from './ScreenshotEditor';
+import Header from './KenbanHeader';
+import Sidebar from './KenbanSidebar';
+import DiffViewer from './DiffViewer';
+import ParallelViewer from './ParallelViewer';
+import TextVerifyViewer from './TextVerifyViewer';
+import { normalizeTextForComparison, computeLineSetDiff, computeSharedGroupDiff, findBestMemoSection, preNormalizeSections } from '../../kenban-utils/textExtract';
+import { parseMemo, matchPageToFile, getUniqueMemoSections, replaceMemoSection } from '../../kenban-utils/memoParser';
+import { useTextExtractWorker } from '../../kenban-hooks/useTextExtractWorker';
+import type { CompareMode, AppMode, FileWithPath, CropBounds, DiffMarker, DiffPart, FilePair, PageCache, ParallelFileEntry, ParallelImageCache, TextVerifyPage } from '../../kenban-utils/kenbanTypes';
+
+
+
+// ============== 差分検出アプリ ==============
+export default function MangaDiffDetector() {
+  const [photoshopPath, setPhotoshopPath] = useState<string | null>(null);
+  const [compareMode, setCompareMode] = useState<CompareMode>('tiff-tiff');
+  const [initialModeSelect, setInitialModeSelect] = useState(true);
+  const [filesA, setFilesA] = useState<File[]>([]);
+  const [filesB, setFilesB] = useState<File[]>([]);
+  const [diffFolderA, setDiffFolderA] = useState<string | null>(null);
+  const [diffFolderB, setDiffFolderB] = useState<string | null>(null);
+  const [pairs, setPairs] = useState<FilePair[]>([]);
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [viewMode, setViewMode] = useState<'A' | 'B' | 'diff' | 'A-full'>('A');
+  const [cropBounds, setCropBounds] = useState<CropBounds | null>(null);
+  const [pairingMode, setPairingMode] = useState<'order' | 'name'>('order');
+  const [filterDiffOnly, setFilterDiffOnly] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [showMarkers, setShowMarkers] = useState(true);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [diffCache, setDiffCache] = useState<Record<string, PageCache>>({});
+  const [isLoadingPage, setIsLoadingPage] = useState(false);
+  const [pdfComputingPages, setPdfComputingPages] = useState<Set<string>>(new Set());
+  const [dragOverSide, setDragOverSide] = useState<string | null>(null);
+  const [preloadProgress, setPreloadProgress] = useState({ loaded: 0, total: 0 });
+  const [optimizeProgress, setOptimizeProgress] = useState<{ fileName: string; message: string; current?: number; total?: number } | null>(null);
+  const [isGDriveBrowserOpen, setIsGDriveBrowserOpen] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [panPosition, setPanPosition] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(true); // デフォルトで折りたたみ
+  const [easterEgg, setEasterEgg] = useState(false);
+  const easterEggBufferRef = useRef('');
+  const dragStartRef = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
+  const cliInitRef = useRef(false); // CLI引数による初期化中はcompareModeリセットをスキップ
+  const imageContainerRef = useRef<HTMLDivElement>(null);
+  // PDF表示はRust PDFiumパイプライン → DataURL img表示（canvas不要）
+  const fileListRef = useRef<HTMLDivElement>(null);  // ファイルリスト用
+  const pageListRef = useRef<HTMLDivElement>(null);  // PDFページリスト用
+  const parallelFileListRef = useRef<HTMLDivElement>(null);  // 並列ビューファイルリスト用
+
+  // ============== 並列ビューモード用のstate ==============
+  const [appMode, setAppMode] = useState<AppMode>('diff-check');
+  const [parallelFolderA, setParallelFolderA] = useState<string | null>(null);
+  const [parallelFolderB, setParallelFolderB] = useState<string | null>(null);
+  const [parallelFilesA, setParallelFilesA] = useState<ParallelFileEntry[]>([]);
+  const [parallelFilesB, setParallelFilesB] = useState<ParallelFileEntry[]>([]);
+  const [parallelCurrentIndex, setParallelCurrentIndex] = useState(0);
+  const [parallelIndexA, setParallelIndexA] = useState(0); // 非同期モード用の個別インデックス
+  const [parallelIndexB, setParallelIndexB] = useState(0); // 非同期モード用の個別インデックス
+  const prevParallelIndexRef = useRef(0); // ナビゲーション方向検知用
+  const [parallelSyncMode, setParallelSyncMode] = useState(true); // 同期モード（デフォルト）
+  const [parallelActivePanel, setParallelActivePanel] = useState<'A' | 'B'>('A'); // 非同期モードでアクティブなパネル
+  const [showSyncOptions, setShowSyncOptions] = useState(false); // 再同期オプション表示
+  const [showPsSelectPopup, setShowPsSelectPopup] = useState(false); // Photoshop選択ポップアップ
+  const [showMojiQSelectPopup, setShowMojiQSelectPopup] = useState(false); // MojiQ選択ポップアップ（並列ビューワー用）
+  const [showFolderSelectPopup, setShowFolderSelectPopup] = useState(false); // フォルダ選択ポップアップ（並列ビューワー用）
+
+  useEffect(() => {
+    const savedPath = window.localStorage.getItem('photoshopExecutablePath');
+    if (savedPath) {
+      setPhotoshopPath(savedPath);
+    }
+  }, []);
+
+  const openInPhotoshop = useCallback(async (path: string) => {
+    try {
+      await invoke('kenban_open_file_in_photoshop', { path, photoshopPath });
+    } catch (err) {
+      const message = typeof err === 'string' ? err : 'Photoshopの起動に失敗しました。';
+      console.error('Failed to open in Photoshop:', err);
+      window.alert(message);
+    }
+  }, [photoshopPath]);
+
+  const handleSelectPhotoshopExecutable = useCallback(async () => {
+    try {
+      const selected = await open({
+        title: 'Photoshop.exe を選択',
+        multiple: false,
+        filters: [{ name: 'Photoshop', extensions: ['exe'] }],
+      });
+      if (!selected || typeof selected !== 'string') return;
+
+      setPhotoshopPath(selected);
+      window.localStorage.setItem('photoshopExecutablePath', selected);
+    } catch (err) {
+      console.error('Failed to select Photoshop executable:', err);
+    }
+  }, []);
+
+  const handleClearPhotoshopExecutable = useCallback(() => {
+    setPhotoshopPath(null);
+    window.localStorage.removeItem('photoshopExecutablePath');
+  }, []);
+  const [spreadSplitModeA, setSpreadSplitModeA] = useState(false); // 見開き分割モード（A側）
+  const [spreadSplitModeB, setSpreadSplitModeB] = useState(false); // 見開き分割モード（B側）
+  const [firstPageSingleA, setFirstPageSingleA] = useState(true); // 1ページ目を単ページ扱い（A側）
+  const [firstPageSingleB, setFirstPageSingleB] = useState(true); // 1ページ目を単ページ扱い（B側）
+  const [parallelImageA, setParallelImageA] = useState<string | null>(null);
+  const [parallelImageB, setParallelImageB] = useState<string | null>(null);
+  const [parallelLoading, setParallelLoading] = useState(false);
+  const [parallelImageCache, setParallelImageCache] = useState<ParallelImageCache>({});
+  const [parallelCapturedImageA, setParallelCapturedImageA] = useState<string | null>(null); // 指示エディタ用
+  const [parallelCapturedImageB, setParallelCapturedImageB] = useState<string | null>(null); // 指示エディタ用
+  const [parallelZoomA, setParallelZoomA] = useState(1); // ズーム（A側）
+  const [parallelZoomB, setParallelZoomB] = useState(1); // ズーム（B側）
+  const [parallelPanA, setParallelPanA] = useState({ x: 0, y: 0 }); // パン位置（A側）
+  const [parallelPanB, setParallelPanB] = useState({ x: 0, y: 0 }); // パン位置（B側）
+  const [isDraggingParallelA, setIsDraggingParallelA] = useState(false); // ドラッグ中（A側）
+  const [isDraggingParallelB, setIsDraggingParallelB] = useState(false); // ドラッグ中（B側）
+  const [isFullscreen, setIsFullscreen] = useState(false); // 全画面表示
+  const [showFullscreenHint, setShowFullscreenHint] = useState(false); // 全画面ヒント表示
+  const [instructionButtonsHidden, setInstructionButtonsHidden] = useState(false); // 指示エディタボタン非表示状態
+
+  // ============== テキスト照合モード用のstate ==============
+  const [textVerifyPages, setTextVerifyPages] = useState<TextVerifyPage[]>([]);
+  const [textVerifyCurrentIndex, setTextVerifyCurrentIndex] = useState(0);
+  const [textVerifyMemoRaw, setTextVerifyMemoRaw] = useState('');
+  const [textVerifyMemoFilePath, setTextVerifyMemoFilePath] = useState<string | null>(null);
+  const [textVerifyHasUnsavedChanges, setTextVerifyHasUnsavedChanges] = useState(false);
+  const [textVerifyUndoStack, setTextVerifyUndoStack] = useState<string[]>([]);
+  const UNDO_MAX = 50;
+  const { extractText: workerExtractText, reassignDiffs: workerReassignDiffs, cancelAll: cancelWorker } = useTextExtractWorker();
+  // extractedLayersキャッシュ: State配列ではなくrefで管理（メモリ削減）
+  // 現在ページのみstateに反映し、他はキャッシュから復元
+  const layerCacheRef = useRef<Map<number, import('./types').ExtractedTextLayer[]>>(new Map());
+  const textVerifyHasUnsavedRef = useRef(false);
+  textVerifyHasUnsavedRef.current = textVerifyHasUnsavedChanges;
+  const textVerifyMemoFilePathRef = useRef<string | null>(null);
+  textVerifyMemoFilePathRef.current = textVerifyMemoFilePath;
+  const saveTextVerifyMemoRef = useRef<() => Promise<boolean>>(async () => false);
+  const textVerifyFileListRef = useRef<HTMLDivElement>(null);
+
+  // ============== 自動更新 ==============
+  const [updateDialogState, setUpdateDialogState] = useState<
+    | { type: 'confirm'; version: string; notes?: string }
+    | { type: 'downloading' }
+    | { type: 'complete' }
+    | { type: 'error'; message: string }
+    | null
+  >(null);
+  const pendingUpdateRef = useRef<Awaited<ReturnType<typeof check>> | null>(null);
+
+  const processingRef = useRef(false);
+  const compareModeRef = useRef(compareMode); // モード変更を追跡
+  const parallelDragStartRefA = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
+  const parallelDragStartRefB = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
+
+  // モード切り替え関数（即座にペアをクリアして誤った処理を防ぐ）
+  const handleModeChange = useCallback((newMode: CompareMode) => {
+    // 現在のモードと同じ場合
+    if (newMode === compareMode) {
+      // 初期モード選択画面からの場合は画面を閉じる
+      if (initialModeSelect) {
+        setInitialModeSelect(false);
+        setSidebarCollapsed(false);
+      }
+      return;
+    }
+    // まず処理フラグをリセットして進行中の処理を止める
+    processingRef.current = false;
+    // ペアとファイルを即座にクリア（自動処理が走らないように）
+    setPairs([]);
+    setFilesA([]);
+    setFilesB([]);
+    // モードを変更
+    setCompareMode(newMode);
+    setInitialModeSelect(false);
+    setSidebarCollapsed(false);
+  }, [compareMode, initialModeSelect]);
+
+  // 隠しコマンド: 初期画面で "kenpan" と入力するとロゴ変更
+  useEffect(() => {
+    if (!initialModeSelect) return;
+    const handler = (e: KeyboardEvent) => {
+      easterEggBufferRef.current += e.key.toLowerCase();
+      if (easterEggBufferRef.current.length > 6) {
+        easterEggBufferRef.current = easterEggBufferRef.current.slice(-6);
+      }
+      if (easterEggBufferRef.current === 'kenpan') {
+        setEasterEgg(prev => !prev);
+        easterEggBufferRef.current = '';
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [initialModeSelect]);
+
+  // モード変更時にリセット（CLI初期化中はスキップ）
+  const prevCompareModeRef = useRef<string | null>(null);
+  useEffect(() => {
+    compareModeRef.current = compareMode; // モード追跡を更新
+    // CLI初期化中、または初回マウント時はリセットしない
+    if (cliInitRef.current) {
+      prevCompareModeRef.current = compareMode;
+      return;
+    }
+    // 前回と同じモードならリセット不要（CLI初期化完了後の再レンダーで発火するケース）
+    if (prevCompareModeRef.current === compareMode) {
+      return;
+    }
+    prevCompareModeRef.current = compareMode;
+    processingRef.current = false; // 進行中の処理フラグをリセット
+    setFilesA([]);
+    setFilesB([]);
+    setDiffFolderA(null);
+    setDiffFolderB(null);
+    setPairs([]);
+    setSelectedIndex(0);
+    setCropBounds(null);
+    setDiffCache(prev => { cleanupPageCache(prev); return {}; });
+    setCurrentPage(1);
+    setPreloadProgress({ loaded: 0, total: 0 });
+    setZoom(1);
+    setPanPosition({ x: 0, y: 0 });
+    setViewMode('A'); // ビューモードをリセット
+    pdfCache.clear();
+  }, [compareMode]);
+
+  // 起動時に更新チェック（2秒遅延でアプリ初期化を待つ）
+  useEffect(() => {
+    const timer = setTimeout(async () => {
+      try {
+        const update = await check();
+        if (update) {
+          pendingUpdateRef.current = update;
+          setUpdateDialogState({
+            type: 'confirm',
+            version: update.version,
+            notes: update.body || undefined
+          });
+        }
+      } catch (e) {
+        console.log('Update check failed:', e);
+      }
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, []);
+
+  // 一時ファイルクリーンアップ（起動時 + 30分ごと）
+  useEffect(() => {
+    // 起動時に古い一時ファイルを削除
+    invoke('kenban_cleanup_preview_cache').catch(console.error);
+
+    // 30分ごとに定期クリーンアップ
+    const interval = setInterval(() => {
+      invoke('kenban_cleanup_preview_cache').catch(console.error);
+    }, 30 * 60 * 1000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  // CLI引数による差分モード自動起動（--diff [mode] folderA folderB [selectionJson]）
+  // mode: "tiff"（デフォルト）, "psd", "psd-tiff"
+  useEffect(() => {
+    (async () => {
+      try {
+        const args: string[] = await invoke('get_cli_args');
+        console.log('[CLI] args:', args);
+        const diffIdx = args.indexOf('--diff');
+        if (diffIdx === -1 || diffIdx + 2 >= args.length) return;
+
+        // モード判定: --diff の次が "tiff" / "psd" / "psd-tiff" ならモード指定、そうでなければフォルダパス
+        let mode: CompareMode = 'tiff-tiff';
+        let folderAIdx = diffIdx + 1;
+        const possibleMode = args[diffIdx + 1];
+        if (possibleMode === 'tiff' || possibleMode === 'psd' || possibleMode === 'psd-tiff') {
+          if (possibleMode === 'psd') mode = 'psd-psd';
+          else if (possibleMode === 'psd-tiff') mode = 'psd-tiff';
+          else mode = 'tiff-tiff';
+          folderAIdx = diffIdx + 2;
+        }
+
+        if (folderAIdx + 1 >= args.length) return;
+        const folderA = args[folderAIdx];
+        const folderB = args[folderAIdx + 1];
+        const selectionJsonArg = args[folderAIdx + 2]; // オプション: 選択範囲JSONパス
+        console.log('[CLI] mode:', mode, 'folderA:', folderA, 'folderB:', folderB, 'jsonArg:', selectionJsonArg);
+
+        // 選択範囲JSON読み込み（psd-tiffモード用、オプション）— state設定前に読み込む
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let jsonData: any = null;
+        let bounds: CropBounds | null = null;
+        if (mode === 'psd-tiff' && selectionJsonArg) {
+          try {
+            const jsonContent: string = await invoke('read_text_file', { path: selectionJsonArg });
+            jsonData = JSON.parse(jsonContent);
+            console.log('[CLI] JSON loaded:', { filesA: jsonData.filesA?.length, filesB: jsonData.filesB?.length, bounds: jsonData.selectionRanges?.[0]?.bounds });
+            if (jsonData.selectionRanges?.length === 0) {
+              bounds = { left: 0, top: 0, right: -1, bottom: -1 };
+            } else if (jsonData.selectionRanges?.[0]?.bounds) {
+              bounds = jsonData.selectionRanges[0].bounds;
+            } else if (jsonData.bounds) {
+              bounds = jsonData.bounds;
+            }
+          } catch (err) {
+            console.error('[CLI] Selection JSON load error:', err);
+          }
+        }
+
+        // ファイル読み込み: JSON内にfilesA/filesBがあればそれを使用、なければフォルダスキャン
+        let filePathsA: string[];
+        let filePathsB: string[];
+
+        if (jsonData?.filesA) {
+          filePathsA = jsonData.filesA;
+        } else {
+          const extensionsA = mode === 'psd-psd' || mode === 'psd-tiff' ? ['psd', 'psb'] : ['tif', 'tiff', 'jpg', 'jpeg'];
+          filePathsA = await invoke<string[]>('list_files_in_folder', {
+            path: folderA, extensions: extensionsA,
+          });
+        }
+
+        if (jsonData?.filesB) {
+          filePathsB = jsonData.filesB;
+        } else {
+          const extensionsB = mode === 'psd-tiff' ? ['tif', 'tiff', 'jpg', 'jpeg'] : (mode === 'psd-psd' ? ['psd', 'psb'] : ['tif', 'tiff', 'jpg', 'jpeg']);
+          filePathsB = await invoke<string[]>('list_files_in_folder', {
+            path: folderB, extensions: extensionsB,
+          });
+        }
+
+        console.log('[CLI] filePathsA:', filePathsA.length, filePathsA.slice(0, 3));
+        console.log('[CLI] filePathsB:', filePathsB.length, filePathsB.slice(0, 3));
+
+        const filesFromA = await readFilesFromPaths(filePathsA);
+        const filesFromB = await readFilesFromPaths(filePathsB);
+        console.log('[CLI] filesFromA:', filesFromA.length, 'filesFromB:', filesFromB.length);
+
+        // 全データ準備完了 → compareModeリセットをスキップしつつ一括設定
+        cliInitRef.current = true;
+        setCompareMode(mode);
+        setInitialModeSelect(false);
+        setSidebarCollapsed(false);
+        setAppMode('diff-check');
+        setDiffFolderA(folderA);
+        setDiffFolderB(folderB);
+        if (bounds) setCropBounds(bounds);
+        setFilesA(filesFromA.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })));
+        setFilesB(filesFromB.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })));
+      } catch (err) {
+        console.error('CLI diff load error:', err);
+      } finally {
+        // React 18の全エフェクト完了後にガードを解除
+        // prevCompareModeRefとの二重ガードにより、早めに解除されても安全
+        setTimeout(() => { cliInitRef.current = false; }, 500);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 更新を実行
+  const handleUpdate = async () => {
+    if (!pendingUpdateRef.current) return;
+    setUpdateDialogState({ type: 'downloading' });
+    try {
+      await pendingUpdateRef.current.downloadAndInstall();
+      setUpdateDialogState({ type: 'complete' });
+      setTimeout(async () => {
+        await relaunch();
+      }, 1500);
+    } catch (e) {
+      console.error('Update failed:', e);
+      setUpdateDialogState({ type: 'error', message: String(e) });
+    }
+  };
+
+  // PDF最適化進捗コールバックの設定
+  useEffect(() => {
+    setOptimizeProgressCallback((fileName, message, current, total) => {
+      // PDFモード以外では進捗表示を無視
+      if (compareModeRef.current !== 'pdf-pdf') return;
+      setOptimizeProgress({ fileName, message, current, total });
+    });
+    return () => setOptimizeProgressCallback(null);
+  }, []);
+
+  // 最適化完了後に進捗をクリア
+  useEffect(() => {
+    if (optimizeProgress) {
+      // 「生成しています」または「完了」メッセージの場合は遅延後にクリア
+      if (optimizeProgress.message.includes('生成しています') || optimizeProgress.message.includes('完了')) {
+        const timer = setTimeout(() => setOptimizeProgress(null), 1000);
+        return () => clearTimeout(timer);
+      }
+    }
+  }, [optimizeProgress]);
+
+  // モード切り替え時に最適化進捗をクリア（PDF以外のモードに切り替えた場合や、前回の処理が残っている場合）
+  useEffect(() => {
+    setOptimizeProgress(null);
+  }, [compareMode]);
+
+  // ファイル・ページ切り替え時にズームリセット（viewMode変更時は維持、Ctrl+0で手動リセット）
+  useEffect(() => {
+    setZoom(1);
+    setPanPosition({ x: 0, y: 0 });
+  }, [selectedIndex, currentPage]);
+
+  // PDF差分モードはRustパイプラインで処理 → DataURL img表示（canvas不要）
+
+  // PDF表示更新（ダブルビューワー用）- Rust PDFiumレンダリング
+  const [parallelPdfImageA, setParallelPdfImageA] = useState<string | null>(null);
+  const [parallelPdfImageB, setParallelPdfImageB] = useState<string | null>(null);
+  // PDFページURLのフロントエンドキャッシュ（IPC不要で即表示するため）
+  const pdfUrlCacheRef = useRef<Record<string, string>>({});
+
+  useEffect(() => {
+    if (appMode !== 'parallel-view') return;
+
+    const entryA = parallelFilesA[parallelIndexA];
+    const entryB = parallelFilesB[parallelIndexB];
+
+    const isPdfA = !!(entryA?.type === 'pdf' && entryA.path && entryA.pdfPage);
+    const isPdfB = !!(entryB?.type === 'pdf' && entryB.path && entryB.pdfPage);
+
+    const keyA = isPdfA ? `${entryA.path}:${entryA.pdfPage! - 1}:${entryA.spreadSide || ''}` : '';
+    const keyB = isPdfB ? `${entryB.path}:${entryB.pdfPage! - 1}:${entryB.spreadSide || ''}` : '';
+
+    const cachedA = isPdfA ? pdfUrlCacheRef.current[keyA] : null;
+    const cachedB = isPdfB ? pdfUrlCacheRef.current[keyB] : null;
+
+    const needA = isPdfA && !cachedA;
+    const needB = isPdfB && !cachedB;
+
+    if (!needA && !needB) {
+      // 両方キャッシュヒット → URLをセット（描画同期はParallelViewerのcanvasで行う）
+      setParallelPdfImageA(cachedA);
+      setParallelPdfImageB(cachedB);
+      return;
+    }
+
+    // キャッシュミス分のみIPCでレンダリング
+    (async () => {
+      const [resultA, resultB] = await Promise.all([
+        needA
+          ? invoke<{ src: string; width: number; height: number }>('render_pdf_page', {
+              path: entryA.path,
+              page: entryA.pdfPage! - 1,
+              dpi: 300.0,
+              splitSide: entryA.spreadSide || null,
+            }).catch(err => { console.error('PDF render A error:', err); return null; })
+          : Promise.resolve(null),
+        needB
+          ? invoke<{ src: string; width: number; height: number }>('render_pdf_page', {
+              path: entryB.path,
+              page: entryB.pdfPage! - 1,
+              dpi: 300.0,
+              splitSide: entryB.spreadSide || null,
+            }).catch(err => { console.error('PDF render B error:', err); return null; })
+          : Promise.resolve(null),
+      ]);
+
+      if (resultA) pdfUrlCacheRef.current[keyA] = convertFileSrc(resultA.src);
+      if (resultB) pdfUrlCacheRef.current[keyB] = convertFileSrc(resultB.src);
+
+      setParallelPdfImageA(resultA ? pdfUrlCacheRef.current[keyA] : cachedA);
+      setParallelPdfImageB(resultB ? pdfUrlCacheRef.current[keyB] : cachedB);
+    })();
+  }, [appMode, parallelFilesA, parallelFilesB, parallelIndexA, parallelIndexB]);
+
+  // モードに応じたファイル拡張子フィルタ
+  const getAcceptedExtensions = useCallback((side: 'A' | 'B') => {
+    switch (compareMode) {
+      case 'tiff-tiff': return ['.tif', '.tiff', '.jpg', '.jpeg'];
+      case 'psd-psd': return ['.psd'];
+      case 'pdf-pdf': return ['.pdf'];
+      case 'psd-tiff': return side === 'A' ? ['.psd'] : ['.tif', '.tiff', '.jpg', '.jpeg'];
+      default: return [];
+    }
+  }, [compareMode]);
+
+  const isAcceptedFile = useCallback((file: File, side: 'A' | 'B') => {
+    const ext = getAcceptedExtensions(side);
+    const name = file.name.toLowerCase();
+    return ext.some(e => name.endsWith(e));
+  }, [getAcceptedExtensions]);
+
+  // JSON読み込み
+  const loadJsonFile = useCallback((file: File): Promise<CropBounds> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const json = JSON.parse(ev.target?.result as string);
+
+          // パターン0: presetData.selectionRangesが空配列（クロップなし＝PSD全体を使用）
+          if (json.presetData?.selectionRanges && json.presetData.selectionRanges.length === 0) {
+            const noCrop: CropBounds = { left: 0, top: 0, right: -1, bottom: -1 };
+            setCropBounds(noCrop);
+            resolve(noCrop);
+            return;
+          }
+
+          // パターン1: presetData.selectionRanges[0].bounds (新形式)
+          if (json.presetData?.selectionRanges?.length > 0 && json.presetData.selectionRanges[0].bounds) {
+            const bounds = json.presetData.selectionRanges[0].bounds;
+            setCropBounds(bounds);
+            resolve(bounds);
+            return;
+          }
+
+          // パターン2: selectionRanges[0].bounds (従来形式)
+          if (json.selectionRanges && json.selectionRanges.length > 0 && json.selectionRanges[0].bounds) {
+            const bounds = json.selectionRanges[0].bounds;
+            setCropBounds(bounds);
+            resolve(bounds);
+            return;
+          }
+
+          // パターン3: bounds直接 (レガシー)
+          if (json.bounds) {
+            setCropBounds(json.bounds);
+            resolve(json.bounds);
+            return;
+          }
+
+          reject(new Error('boundsが見つかりません'));
+        } catch (err) {
+          reject(err);
+        }
+      };
+      reader.onerror = reject;
+      reader.readAsText(file);
+    });
+  }, []);
+
+  // diffCacheをクリアするヘルパー
+  const cleanupPageCache = (_cache: Record<string, PageCache>) => {
+    // Rust DataURL方式ではImageBitmapの手動解放は不要
+  };
+
+  // 差分画像にマーカーを描画（Rust側はマーカーなし画像+座標を返すので、JS側で描画）
+  const drawMarkersOnImage = async (
+    diffSrc: string, markers: DiffMarker[], mode: 'simple' | 'heatmap'
+  ): Promise<string> => {
+    if (!markers || markers.length === 0) return diffSrc;
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d')!;
+        ctx.drawImage(img, 0, 0);
+
+        const isHeatmap = mode === 'heatmap';
+        const outerLineWidth = isHeatmap ? 8 : 6;
+        const innerLineWidth = isHeatmap ? 3 : 2;
+        const innerOffset = isHeatmap ? 5 : 4;
+        const badgeRadius = isHeatmap ? 24 : 18;
+        const badgeOffset = isHeatmap ? 30 : 20;
+        const fontSize = isHeatmap ? 28 : 20;
+
+        ctx.lineWidth = outerLineWidth;
+        markers.forEach((marker, idx) => {
+          // 外側シアン円
+          ctx.strokeStyle = 'cyan';
+          ctx.beginPath();
+          ctx.arc(marker.x, marker.y, marker.radius, 0, Math.PI * 2);
+          ctx.stroke();
+
+          // 内側白円
+          ctx.strokeStyle = 'white';
+          ctx.lineWidth = innerLineWidth;
+          ctx.beginPath();
+          ctx.arc(marker.x, marker.y, marker.radius - innerOffset, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.lineWidth = outerLineWidth;
+
+          // 番号バッジ
+          const badgeY = marker.y - marker.radius - badgeOffset;
+          ctx.fillStyle = 'cyan';
+          ctx.beginPath();
+          ctx.arc(marker.x, badgeY, badgeRadius, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = 'black';
+          ctx.font = `bold ${fontSize}px sans-serif`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(String(idx + 1), marker.x, badgeY);
+        });
+
+        resolve(canvas.toDataURL());
+      };
+      img.crossOrigin = 'anonymous';
+      img.src = diffSrc;
+    });
+  };
+
+  // モードラベル
+  const getModeLabels = () => {
+    switch (compareMode) {
+      case 'tiff-tiff': return { a: 'TIFF (元)', b: 'TIFF (修正)', accept: '.tif,.tiff' };
+      case 'psd-psd': return { a: 'PSD (元)', b: 'PSD (修正)', accept: '.psd' };
+      case 'pdf-pdf': return { a: 'PDF (元)', b: 'PDF (修正)', accept: '.pdf' };
+      case 'psd-tiff': return { a: 'PSD (元)', b: 'TIFF (出力)', accept: { a: '.psd', b: '.tif,.tiff' } };
+      default: return { a: 'A', b: 'B', accept: '*' };
+    }
+  };
+
+  const modeLabels = getModeLabels();
+
+  // ドラッグ中のサイドを追跡するref（Tauriイベント用）
+  const dragOverSideRef = useRef<string | null>(null);
+  const dropZoneARef = useRef<HTMLDivElement>(null);
+  const dropZoneBRef = useRef<HTMLDivElement>(null);
+  const dropZoneJsonRef = useRef<HTMLDivElement>(null);
+  const parallelDropZoneARef = useRef<HTMLDivElement>(null);
+  const parallelDropZoneBRef = useRef<HTMLDivElement>(null);
+  const textVerifyDropPsdRef = useRef<HTMLDivElement>(null);
+  const textVerifyDropMemoRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { dragOverSideRef.current = dragOverSide; }, [dragOverSide]);
+  const appModeRef = useRef<AppMode>(appMode);
+  useEffect(() => { appModeRef.current = appMode; }, [appMode]);
+  const textVerifyMemoRawRef = useRef(textVerifyMemoRaw);
+  useEffect(() => { textVerifyMemoRawRef.current = textVerifyMemoRaw; }, [textVerifyMemoRaw]);
+
+  // Tauriパスからファイルを読み込んでFileオブジェクトに変換
+  const readFilesFromPaths = useCallback(async (paths: string[]): Promise<File[]> => {
+    const mimeTypes: Record<string, string> = {
+      'tif': 'image/tiff', 'tiff': 'image/tiff',
+      'psd': 'image/vnd.adobe.photoshop', 'psb': 'image/vnd.adobe.photoshop',
+      'pdf': 'application/pdf',
+      'json': 'application/json'
+    };
+    const supportedExts = ['psd', 'psb', 'tif', 'tiff', 'jpg', 'jpeg', 'pdf', 'json'];
+
+    // ファイルパスを収集（読み込みはまだしない）
+    const filePaths: string[] = [];
+
+    const addFileIfSupported = (filePath: string, fileName: string) => {
+      const dotIndex = fileName.lastIndexOf('.');
+      const ext = dotIndex > 0 ? fileName.substring(dotIndex + 1).toLowerCase() : '';
+      if (supportedExts.includes(ext)) {
+        filePaths.push(filePath);
+      }
+    };
+
+    const collectFromDir = async (dirPath: string): Promise<void> => {
+      // readDirはディレクトリでない場合にエラーをスロー
+      const entries = await readDir(dirPath);
+      for (const entry of entries) {
+        if (!entry.name) continue;
+        const childPath = dirPath + '\\' + entry.name;
+        if (entry.isDirectory) {
+          await collectFromDir(childPath);
+        } else {
+          addFileIfSupported(childPath, entry.name);
+        }
+      }
+    };
+
+    // パスを収集
+    for (const p of paths) {
+      try {
+        // ディレクトリとして試す（ファイルならエラーになる）
+        await collectFromDir(p);
+      } catch {
+        // ディレクトリでなければファイルとして追加
+        const pathParts = p.replace(/\//g, '\\').split('\\');
+        const name = pathParts[pathParts.length - 1] || '';
+        addFileIfSupported(p, name);
+      }
+    }
+
+    // 並列でファイルを読み込み（パス情報を保持）
+    const filePromises = filePaths.map(async (filePath): Promise<FileWithPath | null> => {
+      const pathParts = filePath.replace(/\//g, '\\').split('\\');
+      const name = pathParts[pathParts.length - 1] || 'unknown';
+      const dotIndex = name.lastIndexOf('.');
+      const ext = dotIndex > 0 ? name.substring(dotIndex + 1).toLowerCase() : '';
+
+      try {
+        // PSD/PSB/PDF/TIF/TIFFはRust側で処理するので、ダミーのFileを作成してパスだけ保持
+        if (ext === 'psd' || ext === 'psb' || ext === 'pdf' || ext === 'tif' || ext === 'tiff') {
+          const file = new File([], name, { type: mimeTypes[ext] || 'application/octet-stream' }) as FileWithPath;
+          file.filePath = filePath;
+          return file;
+        }
+
+        const data = await tauriReadFile(filePath);
+        const file = new File([data], name, { type: mimeTypes[ext] || 'application/octet-stream' }) as FileWithPath;
+        file.filePath = filePath;
+        return file;
+      } catch {
+        console.error('readFilesFromPaths: failed to read file:', filePath);
+        return null;
+      }
+    });
+
+    const results = await Promise.all(filePromises);
+    return results.filter((f): f is FileWithPath => f !== null);
+  }, []);
+
+  // 位置からドロップゾーンを判定
+  const getDropZoneFromPosition = useCallback((x: number, y: number): string | null => {
+    // DPIスケーリングを考慮（Tauriは物理ピクセル、DOMは論理ピクセルを使用）
+    const scale = window.devicePixelRatio || 1;
+    const scaledX = x / scale;
+    const scaledY = y / scale;
+
+    const checkZone = (ref: React.RefObject<HTMLDivElement | null>, name: string): string | null => {
+      if (!ref.current) return null;
+      const rect = ref.current.getBoundingClientRect();
+      if (scaledX >= rect.left && scaledX <= rect.right && scaledY >= rect.top && scaledY <= rect.bottom) {
+        return name;
+      }
+      return null;
+    };
+    // parallel-viewモードのドロップゾーンも検出
+    return checkZone(dropZoneJsonRef, 'json')
+      || checkZone(dropZoneARef, 'A')
+      || checkZone(dropZoneBRef, 'B')
+      || checkZone(parallelDropZoneARef, 'parallelA')
+      || checkZone(parallelDropZoneBRef, 'parallelB')
+      || checkZone(textVerifyDropPsdRef, 'textVerifyPsd')
+      || checkZone(textVerifyDropMemoRef, 'textVerifyMemo');
+  }, []);
+
+  // parallel-viewモードのTauriドロップ処理関数
+  const handleParallelTauriDrop = useCallback(async (paths: string[], side: 'A' | 'B') => {
+    if (paths.length === 0) return;
+    const firstPath = paths[0];
+
+    // ディレクトリかどうかチェック
+    try {
+      await readDir(firstPath); // ディレクトリでなければエラーをスロー
+      // ディレクトリの場合
+      await expandFolderToParallelEntries(firstPath, side);
+    } catch {
+      // ファイルの場合
+      const fileName = firstPath.split(/[/\\]/).pop() || '';
+      const ext = fileName.split('.').pop()?.toLowerCase() || '';
+
+      if (ext === 'pdf') {
+        // PDFファイルの場合はTauriから読み込んでFileオブジェクトを作成
+        try {
+          const bytes = await tauriReadFile(firstPath);
+          const blob = new Blob([bytes], { type: 'application/pdf' });
+          const file = new File([blob], fileName, { type: 'application/pdf' });
+          // 実際のファイルパスを使用（MojiQ連携で必要）
+          await expandPdfToParallelEntries(firstPath, side, file);
+        } catch (err) {
+          console.error('PDF load error:', err);
+        }
+      } else if (['tif', 'tiff', 'psd', 'png', 'jpg', 'jpeg'].includes(ext)) {
+        // 画像ファイルの場合は単一エントリとして追加
+        let type: ParallelFileEntry['type'] = 'image';
+        if (ext === 'tif' || ext === 'tiff') type = 'tiff';
+        else if (ext === 'psd') type = 'psd';
+
+        const entry: ParallelFileEntry = { path: firstPath, name: fileName, type };
+
+        if (side === 'A') {
+          setParallelFolderA(firstPath);
+          setParallelFilesA([entry]);
+        } else {
+          setParallelFolderB(firstPath);
+          setParallelFilesB([entry]);
+        }
+        setParallelCurrentIndex(0);
+        setParallelIndexA(0);
+        setParallelIndexB(0);
+      }
+    }
+  }, []);
+
+  // Tauriドラッグ&ドロップイベントリスナー
+  useEffect(() => {
+    const setupDragDrop = async () => {
+      const appWindow = getCurrentWebviewWindow();
+      const unlisten = await appWindow.onDragDropEvent(async (event) => {
+        if (event.payload.type === 'over') {
+          const { x, y } = event.payload.position;
+          const zone = getDropZoneFromPosition(x, y);
+          setDragOverSide(zone);
+        } else if (event.payload.type === 'drop') {
+          const paths = event.payload.paths;
+          const { x, y } = event.payload.position;
+          const side = getDropZoneFromPosition(x, y) || dragOverSideRef.current;
+          setDragOverSide(null);
+
+          if (!side || paths.length === 0) return;
+
+          // parallel-viewモードのドロップ処理
+          if (side === 'parallelA') {
+            await handleParallelTauriDrop(paths, 'A');
+            return;
+          }
+          if (side === 'parallelB') {
+            await handleParallelTauriDrop(paths, 'B');
+            return;
+          }
+
+          // テキスト照合モードのドロップ処理
+          if (side === 'textVerifyPsd') {
+            const firstPath = paths[0];
+            try {
+              // フォルダかファイルか判定
+              let folderPath: string;
+              try {
+                await readDir(firstPath);
+                folderPath = firstPath;
+              } catch {
+                // ファイルの場合、親フォルダを使用
+                folderPath = firstPath.replace(/[/\\][^/\\]+$/, '');
+              }
+              const files = await invoke<string[]>('list_files_in_folder', {
+                path: folderPath,
+                extensions: ['psd'],
+              });
+              if (files.length === 0) return;
+
+              const pages: TextVerifyPage[] = files.map((filePath, index) => {
+                const fileName = filePath.split(/[/\\]/).pop() || '';
+                return {
+                  fileIndex: index,
+                  fileName,
+                  filePath,
+                  imageSrc: null,
+                  extractedText: '',
+                  extractedLayers: [],
+                  memoText: '',
+                  diffResult: null,
+                  status: 'pending' as const,
+                  psdWidth: 0,
+                  psdHeight: 0,
+                  memoShared: false,
+                  memoSharedGroup: [],
+                };
+              });
+              setTextVerifyPages(pages);
+              setTextVerifyCurrentIndex(0);
+              // メモが既にあればマッチング
+              const currentMemo = textVerifyMemoRawRef.current;
+              if (currentMemo) {
+                const { pages: memoPages, sharedPages } = parseMemo(currentMemo);
+                setTextVerifyPages(pages.map(page => {
+                  const pageNum = matchPageToFile(page.fileName);
+                  const memoText = pageNum !== null ? (memoPages.get(pageNum) || '') : '';
+                  const memoSharedGroup = pageNum !== null ? (sharedPages.get(pageNum) || []) : [];
+                  return { ...page, memoText, memoShared: memoSharedGroup.length > 0, memoSharedGroup };
+                }));
+              }
+            } catch (err) {
+              console.error('Failed to load PSD folder from drop:', err);
+            }
+            return;
+          }
+          if (side === 'textVerifyMemo') {
+            const firstPath = paths[0];
+            try {
+              const bytes = await tauriReadFile(firstPath);
+              const decoder = new TextDecoder('utf-8');
+              const text = decoder.decode(bytes);
+              setTextVerifyMemoFilePath(firstPath);
+              setTextVerifyHasUnsavedChanges(false);
+              setTextVerifyUndoStack([]);
+              applyTextVerifyMemo(text);
+            } catch (err) {
+              console.error('Failed to load memo from drop:', err);
+            }
+            return;
+          }
+
+          // 並列ビューモードのときは差分モード用のドロップを無視
+          if (appModeRef.current === 'parallel-view' && (side === 'A' || side === 'B' || side === 'json')) {
+            return;
+          }
+
+          const allFiles = await readFilesFromPaths(paths);
+          if (allFiles.length === 0) {
+            alert(`ファイル読み込みエラー\nパス: ${paths.join(', ')}`);
+            return;
+          }
+
+          if (side === 'json') {
+            const jsonFile = allFiles.find(f => f.name.toLowerCase().endsWith('.json'));
+            if (!jsonFile) { alert('JSONファイルが見つかりません'); return; }
+            try { await loadJsonFile(jsonFile); } catch { alert('JSONの解析に失敗しました'); }
+            return;
+          }
+
+          const filteredFiles = allFiles.filter(f => isAcceptedFile(f, side as 'A' | 'B'));
+          if (filteredFiles.length === 0) {
+            const ext = getAcceptedExtensions(side as 'A' | 'B').join(', ');
+            alert(`対応ファイルが見つかりません\n（${ext}）`);
+            return;
+          }
+
+          const sortedFiles = filteredFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+          // ドロップ元のフォルダパスを保存（フォルダを開く機能で使用）
+          const droppedPath = paths[0];
+          if (side === 'A') {
+            setDiffFolderA(droppedPath);
+            setFilesA(sortedFiles);
+          } else if (side === 'B') {
+            setDiffFolderB(droppedPath);
+            setFilesB(sortedFiles);
+          }
+        } else if (event.payload.type === 'leave') {
+          setDragOverSide(null);
+        }
+      });
+      return unlisten;
+    };
+
+    const unlistenPromise = setupDragDrop();
+    return () => { unlistenPromise.then(fn => fn()); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [readFilesFromPaths, isAcceptedFile, getAcceptedExtensions, loadJsonFile, getDropZoneFromPosition, handleParallelTauriDrop]);
+
+  // ウィンドウ閉じ時の未保存チェック
+  useEffect(() => {
+    const setupCloseGuard = async () => {
+      const appWindow = getCurrentWebviewWindow();
+      return await appWindow.onCloseRequested(async (event) => {
+        event.preventDefault();
+        try {
+          if (!textVerifyHasUnsavedRef.current) {
+            await appWindow.destroy();
+            return;
+          }
+          if (textVerifyMemoFilePathRef.current) {
+            // ファイルから読み込んだメモ → 保存可能
+            const save = await ask('テキストメモに未保存の変更があります。保存しますか？', {
+              title: 'KENBAN', kind: 'warning', okLabel: '保存して閉じる', cancelLabel: '保存しない',
+            });
+            if (save) await saveTextVerifyMemoRef.current();
+            await appWindow.destroy();
+          } else {
+            // クリップボード貼り付けメモ → 保存先なし、確認のみ
+            const ok = await ask('テキストメモに未保存の変更があります。閉じますか？', {
+              title: 'KENBAN', kind: 'warning', okLabel: '閉じる', cancelLabel: 'キャンセル',
+            });
+            if (!ok) {
+              event.preventDefault();
+            } else {
+              await appWindow.destroy();
+            }
+          }
+        } catch (err) {
+          console.error('Close guard error (allowing close):', err);
+          await appWindow.destroy();
+        }
+        await appWindow.destroy();
+      });
+    };
+    const p = setupCloseGuard();
+    return () => { p.then(fn => fn()); };
+  }, []);
+
+  // DataTransferItemからファイルを再帰的に取得（ブラウザ用フォールバック）
+  const getAllFilesFromDataTransfer = useCallback(async (dataTransfer: DataTransfer) => {
+    const files: File[] = [];
+    const items = Array.from(dataTransfer.items);
+
+    const readDirectory = async (entry: FileSystemEntry, path = ''): Promise<void> => {
+      if (entry.isFile) {
+        return new Promise((resolve) => {
+          (entry as FileSystemFileEntry).file((file) => {
+            Object.defineProperty(file, 'webkitRelativePath', { value: path + file.name, writable: false });
+            files.push(file);
+            resolve();
+          }, () => resolve());
+        });
+      } else if (entry.isDirectory) {
+        const reader = (entry as FileSystemDirectoryEntry).createReader();
+        return new Promise((resolve) => {
+          const readEntries = () => {
+            reader.readEntries(async (entries) => {
+              if (entries.length === 0) {
+                resolve();
+              } else {
+                for (const e of entries) await readDirectory(e, path + entry.name + '/');
+                readEntries();
+              }
+            }, () => resolve());
+          };
+          readEntries();
+        });
+      }
+    };
+
+    for (const item of items) {
+      if (item.kind === 'file') {
+        const entry = item.webkitGetAsEntry?.();
+        if (entry) await readDirectory(entry);
+        else {
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      }
+    }
+    return files;
+  }, []);
+
+  // ホイールハンドラ（分割ビューワー/差分モード用ページめくり）
+  const handleWheelPageTurn = useCallback((e: React.WheelEvent) => {
+    // 分割ビューワーまたは差分モードでホイールによるページめくり
+    e.preventDefault();
+    if (e.deltaY > 0) {
+      // 下スクロール = 次のファイル/ページ
+      setSelectedIndex(i => Math.min(i + 1, pairs.length - 1));
+    } else {
+      // 上スクロール = 前のファイル/ページ
+      setSelectedIndex(i => Math.max(i - 1, 0));
+    }
+  }, [pairs.length]);
+
+
+  const handleImageMouseDown = useCallback((e: React.MouseEvent) => {
+    if (zoom <= 1) return;
+    e.preventDefault();
+    setIsDragging(true);
+    dragStartRef.current = { x: e.clientX, y: e.clientY, panX: panPosition.x, panY: panPosition.y };
+  }, [zoom, panPosition]);
+
+  const handleImageMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!isDragging) return;
+    const dx = e.clientX - dragStartRef.current.x;
+    const dy = e.clientY - dragStartRef.current.y;
+    setPanPosition({ x: dragStartRef.current.panX + dx, y: dragStartRef.current.panY + dy });
+  }, [isDragging]);
+
+  const handleImageMouseUp = useCallback(() => {
+    setIsDragging(false);
+  }, []);
+
+  const handleImageDoubleClick = useCallback(() => {
+    setZoom(1);
+    setPanPosition({ x: 0, y: 0 });
+  }, []);
+
+  // 分割ビューワー用ドラッグハンドラ（A側）
+  const handleParallelMouseDownA = useCallback((e: React.MouseEvent) => {
+    if (parallelZoomA <= 1) return;
+    e.preventDefault();
+    setIsDraggingParallelA(true);
+    parallelDragStartRefA.current = { x: e.clientX, y: e.clientY, panX: parallelPanA.x, panY: parallelPanA.y };
+  }, [parallelZoomA, parallelPanA]);
+
+  const handleParallelMouseMoveA = useCallback((e: React.MouseEvent) => {
+    if (!isDraggingParallelA) return;
+    const dx = e.clientX - parallelDragStartRefA.current.x;
+    const dy = e.clientY - parallelDragStartRefA.current.y;
+    setParallelPanA({ x: parallelDragStartRefA.current.panX + dx, y: parallelDragStartRefA.current.panY + dy });
+  }, [isDraggingParallelA]);
+
+  const handleParallelMouseUpA = useCallback(() => {
+    setIsDraggingParallelA(false);
+  }, []);
+
+  // 分割ビューワー用ドラッグハンドラ（B側）
+  const handleParallelMouseDownB = useCallback((e: React.MouseEvent) => {
+    if (parallelZoomB <= 1) return;
+    e.preventDefault();
+    setIsDraggingParallelB(true);
+    parallelDragStartRefB.current = { x: e.clientX, y: e.clientY, panX: parallelPanB.x, panY: parallelPanB.y };
+  }, [parallelZoomB, parallelPanB]);
+
+  const handleParallelMouseMoveB = useCallback((e: React.MouseEvent) => {
+    if (!isDraggingParallelB) return;
+    const dx = e.clientX - parallelDragStartRefB.current.x;
+    const dy = e.clientY - parallelDragStartRefB.current.y;
+    setParallelPanB({ x: parallelDragStartRefB.current.panX + dx, y: parallelDragStartRefB.current.panY + dy });
+  }, [isDraggingParallelB]);
+
+  const handleParallelMouseUpB = useCallback(() => {
+    setIsDraggingParallelB(false);
+  }, []);
+
+  // ドラッグ＆ドロップハンドラ
+  const handleDragOver = useCallback((e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); }, []);
+  const handleDragEnter = useCallback((side: string) => (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); setDragOverSide(side); }, []);
+  const handleDragLeave = useCallback((e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOverSide(null); }, []);
+
+  const handleDrop = useCallback((side: string) => async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOverSide(null);
+
+    const allFiles = await getAllFilesFromDataTransfer(e.dataTransfer);
+
+    if (side === 'json') {
+      const jsonFile = allFiles.find(f => f.name.toLowerCase().endsWith('.json'));
+      if (!jsonFile) { alert('JSONファイルが見つかりません'); return; }
+      try { await loadJsonFile(jsonFile); } catch { alert('JSONの解析に失敗しました'); }
+      return;
+    }
+
+    const filteredFiles = allFiles.filter(f => isAcceptedFile(f, side as 'A' | 'B'));
+    if (filteredFiles.length === 0) {
+      const ext = getAcceptedExtensions(side as 'A' | 'B').join(', ');
+      alert(`対応ファイルが見つかりません\n（${ext}）`);
+      return;
+    }
+
+    // PDFファイルのサイズチェック（100MB以上で警告）
+    const pdfFile = filteredFiles.find(f => f.name.toLowerCase().endsWith('.pdf'));
+    if (pdfFile && !checkPdfFileSize(pdfFile)) {
+      return; // キャンセルされた場合は処理中断
+    }
+
+    const sortedFiles = filteredFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    if (side === 'A') setFilesA(sortedFiles);
+    else setFilesB(sortedFiles);
+  }, [getAllFilesFromDataTransfer, isAcceptedFile, getAcceptedExtensions, loadJsonFile]);
+
+  // Tauriフォルダ/ファイルダイアログで選択
+  const handleFilesAUpload = async () => {
+    try {
+      const extensions = getAcceptedExtensions('A').map(e => e.replace('.', ''));
+
+      // PDFモードの場合はファイル選択、その他はフォルダ選択
+      if (compareMode === 'pdf-pdf') {
+        const selected = await open({
+          directory: false,
+          multiple: false,
+          title: 'PDFファイルAを選択',
+          filters: [{ name: 'PDF', extensions: ['pdf'] }],
+        });
+        if (!selected || typeof selected !== 'string') return;
+
+        const files = await readFilesFromPaths([selected]);
+        const filtered = files.filter(f => isAcceptedFile(f, 'A'));
+        if (filtered.length === 0) return;
+
+        // PDFファイルのサイズチェック（100MB以上で警告）
+        const pdfFile = filtered[0];
+        if (pdfFile && !checkPdfFileSize(pdfFile)) {
+          return; // キャンセルされた場合は処理中断
+        }
+        setDiffFolderA(null);
+        setFilesA(filtered);
+      } else {
+        const selected = await open({
+          directory: true,
+          multiple: false,
+          title: 'フォルダAを選択',
+        });
+        if (!selected || typeof selected !== 'string') return;
+
+        // フォルダパスを保存
+        setDiffFolderA(selected);
+
+        // Rustでファイル一覧を取得
+        const filePaths = await invoke<string[]>('list_files_in_folder', {
+          path: selected,
+          extensions,
+        });
+
+        const files = await readFilesFromPaths(filePaths);
+        const filtered = files.filter(f => isAcceptedFile(f, 'A'));
+        // PDFファイルのサイズチェック（100MB以上で警告）
+        const pdfFile = filtered.find(f => f.name.toLowerCase().endsWith('.pdf'));
+        if (pdfFile && !checkPdfFileSize(pdfFile)) {
+          return; // キャンセルされた場合は処理中断
+        }
+        setFilesA(filtered.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })));
+      }
+    } catch (err) {
+      console.error('File/Folder selection error:', err);
+    }
+  };
+
+  const handleFilesBUpload = async () => {
+    try {
+      const extensions = getAcceptedExtensions('B').map(e => e.replace('.', ''));
+
+      // PDFモードの場合はファイル選択、その他はフォルダ選択
+      if (compareMode === 'pdf-pdf') {
+        const selected = await open({
+          directory: false,
+          multiple: false,
+          title: 'PDFファイルBを選択',
+          filters: [{ name: 'PDF', extensions: ['pdf'] }],
+        });
+        if (!selected || typeof selected !== 'string') return;
+
+        const files = await readFilesFromPaths([selected]);
+        const filtered = files.filter(f => isAcceptedFile(f, 'B'));
+        if (filtered.length === 0) return;
+
+        // PDFファイルのサイズチェック（100MB以上で警告）
+        const pdfFile = filtered[0];
+        if (pdfFile && !checkPdfFileSize(pdfFile)) {
+          return; // キャンセルされた場合は処理中断
+        }
+        setDiffFolderB(null);
+        setFilesB(filtered);
+      } else {
+        const selected = await open({
+          directory: true,
+          multiple: false,
+          title: 'フォルダBを選択',
+        });
+        if (!selected || typeof selected !== 'string') return;
+
+        // フォルダパスを保存
+        setDiffFolderB(selected);
+
+        // Rustでファイル一覧を取得
+        const filePaths = await invoke<string[]>('list_files_in_folder', {
+          path: selected,
+          extensions,
+        });
+
+        const files = await readFilesFromPaths(filePaths);
+        const filtered = files.filter(f => isAcceptedFile(f, 'B'));
+        // PDFファイルのサイズチェック（100MB以上で警告）
+        const pdfFile = filtered.find(f => f.name.toLowerCase().endsWith('.pdf'));
+        if (pdfFile && !checkPdfFileSize(pdfFile)) {
+          return; // キャンセルされた場合は処理中断
+        }
+        setFilesB(filtered.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })));
+      }
+    } catch (err) {
+      console.error('File/Folder selection error:', err);
+    }
+  };
+
+  // ペアリング
+  useEffect(() => {
+    console.log('[Pairing] filesA:', filesA.length, 'filesB:', filesB.length, 'mode:', pairingMode);
+    if (filesA.length === 0 && filesB.length === 0) { setPairs([]); return; }
+
+    let newPairs: FilePair[] = [];
+    if (pairingMode === 'order') {
+      const maxLen = Math.max(filesA.length, filesB.length);
+      for (let i = 0; i < maxLen; i++) {
+        newPairs.push({
+          index: i, fileA: filesA[i] || null, fileB: filesB[i] || null,
+          nameA: filesA[i]?.name || null, nameB: filesB[i]?.name || null,
+          srcA: null, srcB: null, processedA: null, processedB: null,
+          diffSrc: null, hasDiff: false, diffProbability: 0, totalPages: 1, status: 'pending'
+        });
+      }
+    } else {
+      const getBaseName = (name: string) => name.replace(/\.[^/.]+$/, "");
+      const mapA = new Map<string, File>(), mapB = new Map<string, File>();
+      filesA.forEach(f => mapA.set(getBaseName(f.name), f));
+      filesB.forEach(f => mapB.set(getBaseName(f.name), f));
+      const allNames = new Set([...mapA.keys(), ...mapB.keys()]);
+      const sortedNames = Array.from(allNames).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+
+      sortedNames.forEach((baseName, idx) => {
+        newPairs.push({
+          index: idx, fileA: mapA.get(baseName) || null, fileB: mapB.get(baseName) || null,
+          nameA: mapA.get(baseName)?.name || null, nameB: mapB.get(baseName)?.name || null,
+          srcA: null, srcB: null, processedA: null, processedB: null,
+          diffSrc: null, hasDiff: false, diffProbability: 0, totalPages: 1, status: 'pending'
+        });
+      });
+    }
+
+    console.log('[Pairing] created pairs:', newPairs.length, newPairs.map(p => ({ nameA: p.nameA, nameB: p.nameB })));
+    setPairs(newPairs);
+    setDiffCache(prev => { cleanupPageCache(prev); return {}; });
+    setCurrentPage(1);
+    setPreloadProgress({ loaded: 0, total: 0 });
+    pdfCache.clear();
+    if (newPairs.length > 0 && selectedIndex < 0) setSelectedIndex(0);
+  }, [filesA, filesB, pairingMode]);
+
+  useEffect(() => { setCurrentPage(1); }, [selectedIndex]);
+
+  // ファイルリストの自動スクロール
+  useEffect(() => {
+    if (fileListRef.current && selectedIndex >= 0) {
+      const item = fileListRef.current.querySelector(`[data-index="${selectedIndex}"]`);
+      if (item) item.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }, [selectedIndex]);
+
+  // PDFページリストの自動スクロール
+  useEffect(() => {
+    if (pageListRef.current && currentPage >= 1) {
+      const item = pageListRef.current.querySelector(`[data-page="${currentPage}"]`);
+      if (item) item.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }, [currentPage]);
+
+  // 並列ビューファイルリストの自動スクロール
+  useEffect(() => {
+    if (parallelFileListRef.current) {
+      // 同期モードまたはアクティブパネルに応じてスクロール
+      const targetIndex = parallelSyncMode ? parallelIndexA : (parallelActivePanel === 'A' ? parallelIndexA : parallelIndexB);
+      const item = parallelFileListRef.current.querySelector(`[data-index="${targetIndex}"]`);
+      if (item) item.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }, [parallelIndexA, parallelIndexB, parallelSyncMode, parallelActivePanel]);
+
+  // ペア処理
+  const processPair = useCallback(async (index: number) => {
+    const pair = pairs[index];
+    if (!pair || !pair.fileA || !pair.fileB) return;
+    if (compareMode === 'psd-tiff' && !cropBounds) return;
+
+    const startMode = compareMode; // 処理開始時のモードを記録
+
+    setPairs(prev => {
+      const next = [...prev];
+      next[index] = { ...next[index], status: 'loading' };
+      return next;
+    });
+
+    try {
+      if (compareMode === 'psd-tiff') {
+        // Rust側でPSD読み込み+クロップ+TIFF読み込み+ヒートマップ差分を一括処理
+        const result = await invoke<{
+          src_a: string; src_b: string; processed_a: string; diff_src: string;
+          has_diff: boolean; diff_probability: number; high_density_count: number;
+          markers: DiffMarker[]; image_width: number; image_height: number;
+        }>('compute_diff_heatmap', {
+          psdPath: (pair.fileA as FileWithPath).filePath,
+          tiffPath: (pair.fileB as FileWithPath).filePath,
+          cropBounds, threshold: 70
+        });
+        if (compareModeRef.current !== startMode) return;
+
+        const srcA = convertFileSrc(result.src_a);
+        const srcB = convertFileSrc(result.src_b);
+        const processedA = convertFileSrc(result.processed_a);
+        const diffSrc = convertFileSrc(result.diff_src);
+        const diffSrcWithMarkers = await drawMarkersOnImage(diffSrc, result.markers, 'heatmap');
+        if (compareModeRef.current !== startMode) return;
+
+        setPairs(prev => {
+          const next = [...prev];
+          next[index] = { ...next[index],
+            srcA, srcB,
+            processedA, processedB: srcB,
+            diffSrc, diffSrcWithMarkers,
+            hasDiff: result.has_diff, diffProbability: result.diff_probability,
+            markers: result.markers, imageWidth: result.image_width, imageHeight: result.image_height,
+            status: 'done'
+          };
+          return next;
+        });
+      } else if (compareMode === 'pdf-pdf') {
+        // Rust PDFiumパイプライン: PDFの差分計算をRust側で一括処理
+        const pathA = (pair.fileA as FileWithPath).filePath!;
+        const pathB = (pair.fileB as FileWithPath).filePath!;
+
+        if (globalOptimizeProgress) {
+          globalOptimizeProgress(pair.fileA?.name || 'PDF', 'ページ数を取得中...', 0, 1);
+        }
+
+        // ページ数を取得
+        const [countA, countB] = await Promise.all([
+          invoke<number>('get_pdf_page_count', { path: pathA }),
+          invoke<number>('get_pdf_page_count', { path: pathB })
+        ]);
+        if (compareModeRef.current !== startMode) return;
+
+        const totalPages = Math.min(countA, countB);
+
+        if (globalOptimizeProgress) {
+          globalOptimizeProgress(pair.fileA?.name || 'PDF', '1ページ目の差分を計算中...', 1, totalPages);
+        }
+
+        // 1ページ目の差分をRust側で計算（PDFiumレンダリング + rayon並列差分）
+        const result = await invoke<{
+          src_a: string; src_b: string; diff_src: string;
+          has_diff: boolean; diff_count: number;
+          markers: DiffMarker[]; image_width: number; image_height: number;
+        }>('compute_pdf_diff', {
+          pathA, pathB, page: 0, dpi: 300.0, threshold: 5
+        });
+        if (compareModeRef.current !== startMode) return;
+
+        if (globalOptimizeProgress) {
+          globalOptimizeProgress(pair.fileA?.name || 'PDF', '準備完了', totalPages, totalPages);
+        }
+
+        // ファイルパスをasset://に変換
+        const srcA = convertFileSrc(result.src_a);
+        const srcB = convertFileSrc(result.src_b);
+        const diffSrc = convertFileSrc(result.diff_src);
+
+        // マーカー付き差分画像を生成
+        const diffSrcWithMarkers = await drawMarkersOnImage(diffSrc, result.markers, 'simple');
+        if (compareModeRef.current !== startMode) return;
+
+        const cacheKey = `${index}-1`;
+        setDiffCache(prev => ({
+          ...prev,
+          [cacheKey]: {
+            srcA, srcB,
+            diffSrc, diffSrcWithMarkers,
+            hasDiff: result.has_diff, markers: result.markers,
+            imageWidth: result.image_width, imageHeight: result.image_height
+          }
+        }));
+
+        setPreloadProgress({ loaded: totalPages, total: totalPages });
+
+        setPairs(prev => {
+          const next = [...prev];
+          next[index] = {
+            ...next[index],
+            srcA, srcB,
+            processedA: srcA, processedB: srcB,
+            diffSrc, diffSrcWithMarkers,
+            hasDiff: result.has_diff, markers: result.markers,
+            totalPages, status: 'done'
+          };
+          return next;
+        });
+      } else {
+        // Rust側でファイル読み込み+差分計算を一括処理（tiff-tiff / psd-psd）
+        const result = await invoke<{
+          src_a: string; src_b: string; diff_src: string;
+          has_diff: boolean; diff_count: number;
+          markers: DiffMarker[]; image_width: number; image_height: number;
+        }>('compute_diff_simple', {
+          pathA: (pair.fileA as FileWithPath).filePath,
+          pathB: (pair.fileB as FileWithPath).filePath,
+          threshold: 5
+        });
+        if (compareModeRef.current !== startMode) return;
+
+        const srcA = convertFileSrc(result.src_a);
+        const srcB = convertFileSrc(result.src_b);
+        const diffSrc = convertFileSrc(result.diff_src);
+        const diffSrcWithMarkers = await drawMarkersOnImage(diffSrc, result.markers, 'simple');
+        if (compareModeRef.current !== startMode) return;
+
+        setPairs(prev => {
+          const next = [...prev];
+          next[index] = { ...next[index],
+            srcA, srcB,
+            processedA: srcA, processedB: srcB,
+            diffSrc, diffSrcWithMarkers,
+            hasDiff: result.has_diff, markers: result.markers,
+            status: 'done'
+          };
+          return next;
+        });
+      }
+    } catch (err: any) {
+      // モードが変わっていたらエラー処理もスキップ
+      if (compareModeRef.current !== startMode) return;
+      const errorMessage = typeof err === 'string' ? err : err?.message || String(err);
+      console.error("Processing error:", errorMessage);
+      setPairs(prev => {
+        const next = [...prev];
+        next[index] = { ...next[index], status: 'error', errorMessage };
+        return next;
+      });
+    }
+  }, [pairs, compareMode, cropBounds]);
+
+  // Phase1: 軽量差分チェック（画像エンコードなし）
+  const checkPair = useCallback(async (index: number) => {
+    const pair = pairs[index];
+    if (!pair || !pair.fileA || !pair.fileB) return;
+    if (compareMode === 'psd-tiff' && !cropBounds) return;
+
+    const startMode = compareMode;
+
+    setPairs(prev => {
+      const next = [...prev];
+      next[index] = { ...next[index], status: 'loading' };
+      return next;
+    });
+
+    try {
+      if (compareMode === 'psd-tiff') {
+        const result = await invoke<{
+          has_diff: boolean; diff_probability: number; high_density_count: number;
+          markers: DiffMarker[]; image_width: number; image_height: number;
+        }>('check_diff_heatmap', {
+          psdPath: (pair.fileA as FileWithPath).filePath,
+          tiffPath: (pair.fileB as FileWithPath).filePath,
+          cropBounds, threshold: 70
+        });
+        if (compareModeRef.current !== startMode) return;
+
+        setPairs(prev => {
+          const next = [...prev];
+          next[index] = { ...next[index],
+            hasDiff: result.has_diff, diffProbability: result.diff_probability,
+            markers: result.markers, imageWidth: result.image_width, imageHeight: result.image_height,
+            status: 'checked'
+          };
+          return next;
+        });
+      } else {
+        // tiff-tiff / psd-psd
+        const result = await invoke<{
+          has_diff: boolean; diff_count: number;
+          markers: DiffMarker[]; image_width: number; image_height: number;
+        }>('check_diff_simple', {
+          pathA: (pair.fileA as FileWithPath).filePath,
+          pathB: (pair.fileB as FileWithPath).filePath,
+          threshold: 5
+        });
+        if (compareModeRef.current !== startMode) return;
+
+        setPairs(prev => {
+          const next = [...prev];
+          next[index] = { ...next[index],
+            hasDiff: result.has_diff, markers: result.markers,
+            imageWidth: result.image_width, imageHeight: result.image_height,
+            status: 'checked'
+          };
+          return next;
+        });
+      }
+    } catch (err: any) {
+      if (compareModeRef.current !== startMode) return;
+      const errorMessage = typeof err === 'string' ? err : err?.message || String(err);
+      console.error("Check error:", errorMessage);
+      setPairs(prev => {
+        const next = [...prev];
+        next[index] = { ...next[index], status: 'error', errorMessage };
+        return next;
+      });
+    }
+  }, [pairs, compareMode, cropBounds]);
+
+  // 自動処理
+  useEffect(() => {
+    if (processingRef.current) return;
+
+    if (compareMode === 'pdf-pdf') {
+      // PDF-PDFは従来通り逐次フルレンダー
+      const pendingIndex = pairs.findIndex(p => p.status === 'pending' && p.fileA && p.fileB);
+      if (pendingIndex >= 0) {
+        processingRef.current = true;
+        processPair(pendingIndex).finally(() => { processingRef.current = false; });
+      }
+    } else {
+      // TIFF/PSD系: Phase1軽量チェックを最大4件並列実行
+      const pendingPairs = pairs
+        .map((p, i) => ({ pair: p, index: i }))
+        .filter(({ pair }) => pair.status === 'pending' && pair.fileA && pair.fileB);
+
+      if (pendingPairs.length > 0 && (compareMode !== 'psd-tiff' || cropBounds)) {
+        processingRef.current = true;
+        const batch = pendingPairs.slice(0, 4);
+        Promise.all(batch.map(({ index }) => checkPair(index)))
+          .finally(() => { processingRef.current = false; });
+      }
+    }
+  }, [pairs, processPair, checkPair, compareMode, cropBounds]);
+
+  // Phase2: checked状態のペアが選択されたらフルレンダー
+  const renderingIndexRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (compareMode === 'pdf-pdf') return;
+    const pair = pairs[selectedIndex];
+    if (!pair || pair.status !== 'checked') return;
+    if (renderingIndexRef.current === selectedIndex) return; // 既にレンダー中
+
+    renderingIndexRef.current = selectedIndex;
+    setPairs(prev => {
+      const next = [...prev];
+      next[selectedIndex] = { ...next[selectedIndex], status: 'rendering' };
+      return next;
+    });
+    processPair(selectedIndex).finally(() => {
+      renderingIndexRef.current = null;
+    });
+  }, [selectedIndex, pairs, compareMode, processPair]);
+
+  // Phase2 プリフェッチ: 選択ペアがdoneになったら前後のcheckedペアを先読み
+  const prefetchSelectedRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (compareMode === 'pdf-pdf') return;
+    const pair = pairs[selectedIndex];
+    if (!pair || pair.status !== 'done') return;
+    if (prefetchSelectedRef.current === selectedIndex) return;
+
+    prefetchSelectedRef.current = selectedIndex;
+    const currentMode = compareMode;
+
+    const prefetchOrder = [
+      selectedIndex + 1, selectedIndex - 1,
+      selectedIndex + 2, selectedIndex - 2,
+    ];
+
+    (async () => {
+      for (const idx of prefetchOrder) {
+        if (compareModeRef.current !== currentMode) break;
+        if (prefetchSelectedRef.current !== selectedIndex) break;
+
+        if (idx < 0 || idx >= pairs.length) continue;
+        const p = pairs[idx];
+        if (!p || p.status !== 'checked') continue;
+
+        await processPair(idx);
+      }
+    })();
+  }, [selectedIndex, pairs, compareMode, processPair]);
+
+  // PDFページ切り替え
+  useEffect(() => {
+    if (compareMode !== 'pdf-pdf') return;
+    const pair = pairs[selectedIndex];
+    if (!pair || pair.status !== 'done') return;
+
+    const cacheKey = `${selectedIndex}-${currentPage}`;
+    if (diffCache[cacheKey]) return;
+
+    pdfCache.prioritizePage(pair.fileA!, pair.fileB!, currentPage, pair.totalPages);
+
+    const loadPage = async () => {
+      setIsLoadingPage(true);
+      setPdfComputingPages(prev => new Set(prev).add(cacheKey));
+      try {
+        const pathA = (pair.fileA as FileWithPath).filePath!;
+        const pathB = (pair.fileB as FileWithPath).filePath!;
+
+        // Rust PDFiumパイプラインで差分計算
+        const result = await invoke<{
+          src_a: string; src_b: string; diff_src: string;
+          has_diff: boolean; diff_count: number;
+          markers: DiffMarker[]; image_width: number; image_height: number;
+        }>('compute_pdf_diff', {
+          pathA, pathB, page: currentPage - 1, dpi: 300.0, threshold: 5
+        });
+
+        const srcA = convertFileSrc(result.src_a);
+        const srcB = convertFileSrc(result.src_b);
+        const diffSrc = convertFileSrc(result.diff_src);
+        const diffSrcWithMarkers = await drawMarkersOnImage(diffSrc, result.markers, 'simple');
+
+        setDiffCache(prev => ({
+          ...prev,
+          [cacheKey]: {
+            srcA, srcB,
+            diffSrc, diffSrcWithMarkers,
+            hasDiff: result.has_diff, markers: result.markers,
+            imageWidth: result.image_width, imageHeight: result.image_height
+          }
+        }));
+      } catch (err) {
+        console.error("Page load error:", err);
+      }
+      setPdfComputingPages(prev => { const next = new Set(prev); next.delete(cacheKey); return next; });
+      setIsLoadingPage(false);
+    };
+
+    loadPage();
+  }, [currentPage, selectedIndex, pairs, compareMode, diffCache]);
+
+  // PDF全ページの差分を一斉計算（バックグラウンド）
+  useEffect(() => {
+    if (compareMode !== 'pdf-pdf') return;
+    const pair = pairs[selectedIndex];
+    if (!pair || pair.status !== 'done' || !pair.totalPages || pair.totalPages <= 1) return;
+
+    const calculateAllPages = async () => {
+      // 現在ページの前後3ページを優先、残りはアイドル時に順次処理
+      const priorityPages: number[] = [];
+      for (let offset = 0; offset <= 3; offset++) {
+        if (currentPage + offset <= pair.totalPages!) priorityPages.push(currentPage + offset);
+        if (offset > 0 && currentPage - offset >= 1) priorityPages.push(currentPage - offset);
+      }
+      const remainingPages = Array.from({ length: pair.totalPages! }, (_, i) => i + 1)
+        .filter(p => !priorityPages.includes(p));
+      const pageOrder = [...priorityPages, ...remainingPages];
+
+      const pathA = (pair.fileA as FileWithPath).filePath!;
+      const pathB = (pair.fileB as FileWithPath).filePath!;
+
+      for (const page of pageOrder) {
+        const cacheKey = `${selectedIndex}-${page}`;
+        if (diffCache[cacheKey]) continue;
+
+        setPdfComputingPages(prev => new Set(prev).add(cacheKey));
+        try {
+          // Rust PDFiumパイプラインで差分計算
+          const result = await invoke<{
+            src_a: string; src_b: string; diff_src: string;
+            has_diff: boolean; diff_count: number;
+            markers: DiffMarker[]; image_width: number; image_height: number;
+          }>('compute_pdf_diff', {
+            pathA, pathB, page: page - 1, dpi: 300.0, threshold: 5
+          });
+
+          const srcA = convertFileSrc(result.src_a);
+          const srcB = convertFileSrc(result.src_b);
+          const diffSrc = convertFileSrc(result.diff_src);
+          const diffSrcWithMarkers = await drawMarkersOnImage(diffSrc, result.markers, 'simple');
+
+          setDiffCache(prev => {
+            if (prev[cacheKey]) return prev;
+            return {
+              ...prev,
+              [cacheKey]: {
+                srcA, srcB,
+                diffSrc, diffSrcWithMarkers,
+                hasDiff: result.has_diff, markers: result.markers,
+                imageWidth: result.image_width, imageHeight: result.image_height
+              }
+            };
+          });
+          setPdfComputingPages(prev => { const next = new Set(prev); next.delete(cacheKey); return next; });
+
+          // ページ間で少し待機してGCの機会を与える
+          await new Promise(r => setTimeout(r, 50));
+        } catch (err) {
+          console.error(`Page ${page} diff calculation error:`, err);
+          setPdfComputingPages(prev => { const next = new Set(prev); next.delete(cacheKey); return next; });
+        }
+      }
+    };
+
+    calculateAllPages();
+  }, [selectedIndex, pairs, compareMode]); // diffCacheは依存配列から除外（無限ループ防止）
+
+  // ============== 並列ビューモード用の関数 ==============
+
+  // 画像サイズ取得（画面サイズの50%）
+  const getParallelDisplaySize = useCallback(() => {
+    const width = Math.floor(window.innerWidth * 0.45);
+    const height = Math.floor(window.innerHeight * 0.8);
+    return { maxWidth: width, maxHeight: height };
+  }, []);
+
+  // 差分モードから並列ビューモードへの状態引き継ぎ
+  const transferDiffToParallelView = useCallback(async () => {
+    // ファイルリストが空の場合は何もしない
+    if (filesA.length === 0 && filesB.length === 0) return;
+
+    const { maxWidth, maxHeight } = getParallelDisplaySize();
+
+    // PDF-PDFモードの場合、各ページを個別のエントリとして作成
+    if (compareMode === 'pdf-pdf' && pairs.length > 0 && pairs[0].totalPages && pairs[0].totalPages > 1) {
+      const totalPages = pairs[0].totalPages;
+      const pdfFileA = filesA[0];
+      const pdfFileB = filesB[0];
+      const filePathA = (pdfFileA as FileWithPath).filePath || '';
+      const filePathB = (pdfFileB as FileWithPath).filePath || '';
+
+      // === MojiQ同様: 全ページ事前変換 ===
+      if (globalOptimizeProgress) {
+        globalOptimizeProgress(pdfFileA.name, 'ダブルビューワー準備中...', 0, totalPages);
+      }
+
+      // 全ページをDataURL変換してparallelImageCacheに保存
+      // PDF表示はCanvas直接レンダリングを使用するため、事前変換は不要
+      // useEffectのparallelPdfCanvasA/BRefで必要時にImageBitmapから描画される
+      // PDF並列ビューはCanvas直接レンダリング（pdfCache.renderPageBitmap）を使用
+      // diffCacheはImageBitmapのため、DataURL変換は不要
+      // === PDFキャッシュ移行不要 ===
+
+      // A側のPDFページエントリを作成
+      const entriesA: ParallelFileEntry[] = [];
+      for (let page = 1; page <= totalPages; page++) {
+        entriesA.push({
+          path: filePathA,
+          name: `${pdfFileA.name} (P.${page})`,
+          type: 'pdf',
+          pageCount: totalPages,
+          pdfPage: page,
+          pdfFile: pdfFileA,
+        });
+      }
+      const folderPathA = filePathA.substring(0, filePathA.lastIndexOf(/[/\\]/.test(filePathA) ? (filePathA.includes('\\') ? '\\' : '/') : '/')) || 'diff-mode';
+      setParallelFolderA(folderPathA);
+      setParallelFilesA(entriesA);
+
+      // B側のPDFページエントリを作成
+      const entriesB: ParallelFileEntry[] = [];
+      for (let page = 1; page <= totalPages; page++) {
+        entriesB.push({
+          path: filePathB,
+          name: `${pdfFileB.name} (P.${page})`,
+          type: 'pdf',
+          pageCount: totalPages,
+          pdfPage: page,
+          pdfFile: pdfFileB,
+        });
+      }
+      const folderPathB = filePathB.substring(0, filePathB.lastIndexOf(/[/\\]/.test(filePathB) ? (filePathB.includes('\\') ? '\\' : '/') : '/')) || 'diff-mode';
+      setParallelFolderB(folderPathB);
+      setParallelFilesB(entriesB);
+
+      // 現在のページに対応するインデックスを設定
+      const pageIndex = currentPage - 1;
+      setParallelCurrentIndex(pageIndex);
+      setParallelIndexA(pageIndex);
+      setParallelIndexB(pageIndex);
+
+      // 進捗表示をクリア
+      if (globalOptimizeProgress) {
+        globalOptimizeProgress('', '完了', totalPages, totalPages);
+      }
+      return;
+    }
+
+    // ファイルをParallelFileEntry形式に変換するヘルパー関数
+    const convertToParallelEntry = (file: File): ParallelFileEntry => {
+      const fileWithPath = file as FileWithPath;
+      const filePath = fileWithPath.filePath || '';
+      const name = file.name;
+      const ext = name.split('.').pop()?.toLowerCase() || '';
+      let type: ParallelFileEntry['type'] = 'image';
+      if (ext === 'tif' || ext === 'tiff') type = 'tiff';
+      else if (ext === 'psd') type = 'psd';
+      else if (ext === 'pdf') type = 'pdf';
+
+      return { path: filePath, name, type };
+    };
+
+    // filesAをParallelFileEntry[]に変換
+    if (filesA.length > 0) {
+      const entriesA = filesA.map(convertToParallelEntry);
+      const firstFilePath = (filesA[0] as FileWithPath).filePath || '';
+      const folderPath = firstFilePath.substring(0, firstFilePath.lastIndexOf(/[/\\]/.test(firstFilePath) ? (firstFilePath.includes('\\') ? '\\' : '/') : '/')) || 'diff-mode';
+      setParallelFolderA(folderPath);
+      setParallelFilesA(entriesA);
+
+      // 処理済み画像をキャッシュに追加
+      pairs.forEach((pair) => {
+        if (pair.processedA && pair.fileA) {
+          const fileWithPath = pair.fileA as FileWithPath;
+          if (fileWithPath.filePath) {
+            const cacheKey = `${fileWithPath.filePath}:${maxWidth}x${maxHeight}`;
+            setParallelImageCache(prev => ({
+              ...prev,
+              [cacheKey]: { imageUrl: pair.processedA!, width: 0, height: 0 },
+            }));
+          }
+        }
+      });
+    }
+
+    // filesBをParallelFileEntry[]に変換
+    if (filesB.length > 0) {
+      const entriesB = filesB.map(convertToParallelEntry);
+      const firstFilePath = (filesB[0] as FileWithPath).filePath || '';
+      const folderPath = firstFilePath.substring(0, firstFilePath.lastIndexOf(/[/\\]/.test(firstFilePath) ? (firstFilePath.includes('\\') ? '\\' : '/') : '/')) || 'diff-mode';
+      setParallelFolderB(folderPath);
+      setParallelFilesB(entriesB);
+
+      // 処理済み画像をキャッシュに追加
+      pairs.forEach((pair) => {
+        if (pair.processedB && pair.fileB) {
+          const fileWithPath = pair.fileB as FileWithPath;
+          if (fileWithPath.filePath) {
+            const cacheKey = `${fileWithPath.filePath}:${maxWidth}x${maxHeight}`;
+            setParallelImageCache(prev => ({
+              ...prev,
+              [cacheKey]: { imageUrl: pair.processedB!, width: 0, height: 0 },
+            }));
+          }
+        }
+      });
+    }
+
+    // 現在選択中のインデックスを引き継ぐ
+    setParallelCurrentIndex(selectedIndex);
+    setParallelIndexA(selectedIndex);
+    setParallelIndexB(selectedIndex);
+  }, [filesA, filesB, pairs, selectedIndex, getParallelDisplaySize, compareMode, currentPage, diffCache]);
+
+  // フォルダ選択
+  const handleSelectParallelFolder = async (side: 'A' | 'B') => {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: `フォルダ${side}を選択`,
+      });
+
+      if (selected && typeof selected === 'string') {
+        // Rustでファイル一覧を取得
+        const files = await invoke<string[]>('list_files_in_folder', {
+          path: selected,
+          extensions: ['tif', 'tiff', 'psd', 'png', 'jpg', 'jpeg', 'pdf'],
+        });
+
+        const entries: ParallelFileEntry[] = files.map(filePath => {
+          const name = filePath.split(/[/\\]/).pop() || '';
+          const ext = name.split('.').pop()?.toLowerCase() || '';
+          let type: ParallelFileEntry['type'] = 'image';
+          if (ext === 'tif' || ext === 'tiff') type = 'tiff';
+          else if (ext === 'psd') type = 'psd';
+          else if (ext === 'pdf') type = 'pdf';
+          return { path: filePath, name, type };
+        });
+
+        if (side === 'A') {
+          setParallelFolderA(selected);
+          setParallelFilesA(entries);
+        } else {
+          setParallelFolderB(selected);
+          setParallelFilesB(entries);
+        }
+        setParallelCurrentIndex(0);
+      }
+    } catch (err) {
+      console.error('Folder selection error:', err);
+    }
+  };
+
+  // PDFファイル選択（並列ビュー用）
+  const handleSelectParallelPdf = async (side: 'A' | 'B') => {
+    try {
+      const selected = await open({
+        directory: false,
+        multiple: false,
+        title: `PDF${side}を選択`,
+        filters: [{ name: 'PDF', extensions: ['pdf'] }],
+      });
+
+      if (selected && typeof selected === 'string') {
+        await expandPdfToParallelEntries(selected, side);
+      }
+    } catch (err) {
+      console.error('PDF selection error:', err);
+    }
+  };
+
+  // PDFをページエントリに展開する
+  const expandPdfToParallelEntries = async (pdfPath: string, side: 'A' | 'B', droppedFile?: File, forceSplitMode?: boolean) => {
+    try {
+      const fileName = pdfPath.split(/[/\\]/).pop() || 'PDF';
+
+      // PDFページ数をRust PDFium経由で取得
+      const numPages = await invoke<number>('get_pdf_page_count', { path: pdfPath });
+
+      // 各ページをエントリとして展開
+      const entries: ParallelFileEntry[] = [];
+      const splitMode = forceSplitMode !== undefined ? forceSplitMode : (side === 'A' ? spreadSplitModeA : spreadSplitModeB);
+      const firstSingle = side === 'A' ? firstPageSingleA : firstPageSingleB;
+      for (let page = 1; page <= numPages; page++) {
+        if (splitMode) {
+          // 見開き分割モード
+          const isFirstPage = page === 1;
+          if (isFirstPage && firstSingle) {
+            // 1ページ目を単ページ扱い
+            entries.push({
+              path: pdfPath,
+              name: `${fileName} (P.${page}/${numPages})`,
+              type: 'pdf',
+              pageCount: numPages,
+              pdfPage: page,
+              pdfFile: droppedFile,
+            });
+          } else {
+            // 見開きを分割（右から読み: right→left）
+            entries.push({
+              path: pdfPath,
+              name: `${fileName} (P.${page}右/${numPages})`,
+              type: 'pdf',
+              pageCount: numPages,
+              pdfPage: page,
+              pdfFile: droppedFile,
+              spreadSide: 'right',
+            });
+            entries.push({
+              path: pdfPath,
+              name: `${fileName} (P.${page}左/${numPages})`,
+              type: 'pdf',
+              pageCount: numPages,
+              pdfPage: page,
+              pdfFile: droppedFile,
+              spreadSide: 'left',
+            });
+          }
+        } else {
+          // 通常モード
+          entries.push({
+            path: pdfPath,
+            name: `${fileName} (P.${page}/${numPages})`,
+            type: 'pdf',
+            pageCount: numPages,
+            pdfPage: page,
+            pdfFile: droppedFile,
+          });
+        }
+      }
+
+      if (side === 'A') {
+        setParallelFolderA(pdfPath);
+        setParallelFilesA(entries);
+      } else {
+        setParallelFolderB(pdfPath);
+        setParallelFilesB(entries);
+      }
+      setParallelCurrentIndex(0);
+    } catch (err) {
+      console.error('PDF expansion error:', err);
+    }
+  };
+
+  // 並列ビューモードでのドロップ処理
+  const handleParallelDrop = async (e: React.DragEvent, side: 'A' | 'B') => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOverSide(null);
+
+    const items = e.dataTransfer.items;
+    const files = Array.from(e.dataTransfer.files);
+
+    // webkitGetAsEntryでディレクトリかどうかを判定
+    if (items.length > 0) {
+      const firstItem = items[0];
+      const entry = firstItem.webkitGetAsEntry?.();
+
+      if (entry?.isDirectory) {
+        // フォルダがドロップされた場合
+        // Tauriではファイルオブジェクトのpathプロパティからパスを取得
+        const file = files[0] as File & { path?: string };
+        if (file?.path) {
+          await expandFolderToParallelEntries(file.path, side);
+          return;
+        }
+      }
+    }
+
+    // ファイルがドロップされた場合
+    if (files.length > 0) {
+      const file = files[0] as File & { path?: string };
+      const fileName = file.name;
+      const ext = fileName.split('.').pop()?.toLowerCase() || '';
+
+      if (ext === 'pdf') {
+        // PDFファイルのサイズチェック（100MB以上で警告）
+        if (!checkPdfFileSize(file)) {
+          return; // キャンセルされた場合は処理中断
+        }
+        // Tauriの場合は実際のファイルパスを使用、ブラウザの場合は疑似パス
+        const pdfPath = file.path || `dropped:${fileName}`;
+        await expandPdfToParallelEntries(pdfPath, side, file);
+      } else if (['tif', 'tiff', 'psd', 'png', 'jpg', 'jpeg'].includes(ext)) {
+        // 画像ファイルの場合は単一エントリとして追加
+        let type: ParallelFileEntry['type'] = 'image';
+        if (ext === 'tif' || ext === 'tiff') type = 'tiff';
+        else if (ext === 'psd') type = 'psd';
+
+        // Tauriの場合はpathプロパティを使用、ブラウザの場合はObjectURLを作成
+        const filePath = file.path || URL.createObjectURL(file);
+        const entry: ParallelFileEntry = { path: filePath, name: fileName, type };
+
+        if (side === 'A') {
+          setParallelFolderA(filePath);
+          setParallelFilesA([entry]);
+        } else {
+          setParallelFolderB(filePath);
+          setParallelFilesB([entry]);
+        }
+        setParallelCurrentIndex(0);
+        setParallelIndexA(0);
+        setParallelIndexB(0);
+      }
+    }
+  };
+
+  // フォルダをエントリに展開
+  const expandFolderToParallelEntries = async (folderPath: string, side: 'A' | 'B') => {
+    try {
+      const files = await invoke<string[]>('list_files_in_folder', {
+        path: folderPath,
+        extensions: ['tif', 'tiff', 'psd', 'png', 'jpg', 'jpeg', 'pdf'],
+      });
+
+      const entries: ParallelFileEntry[] = files.map(filePath => {
+        const name = filePath.split(/[/\\]/).pop() || '';
+        const ext = name.split('.').pop()?.toLowerCase() || '';
+        let type: ParallelFileEntry['type'] = 'image';
+        if (ext === 'tif' || ext === 'tiff') type = 'tiff';
+        else if (ext === 'psd') type = 'psd';
+        else if (ext === 'pdf') type = 'pdf';
+        return { path: filePath, name, type };
+      });
+
+      if (side === 'A') {
+        setParallelFolderA(folderPath);
+        setParallelFilesA(entries);
+      } else {
+        setParallelFolderB(folderPath);
+        setParallelFilesB(entries);
+      }
+      setParallelCurrentIndex(0);
+    } catch (err) {
+      console.error('Folder expansion error:', err);
+    }
+  };
+
+  // 並列ビューモードの画像読み込み
+  const loadParallelImages = useCallback(async (skipCache: boolean = false) => {
+    if (appMode !== 'parallel-view') return;
+
+    // 常に個別インデックスを使用（同期モードでも両方のインデックスは同時に更新される）
+    const fileA = parallelFilesA[parallelIndexA];
+    const fileB = parallelFilesB[parallelIndexB];
+
+    if (!fileA && !fileB) {
+      setParallelImageA(null);
+      setParallelImageB(null);
+      return;
+    }
+
+    // PDFはRust PDFiumのuseEffectで処理されるのでスキップ
+    const loadA = fileA?.type !== 'pdf' ? fileA : null;
+    const loadB = fileB?.type !== 'pdf' ? fileB : null;
+
+    if (loadA || loadB) {
+      setParallelLoading(true);
+      const { maxWidth, maxHeight } = getParallelDisplaySize();
+
+      try {
+        const [imageA, imageB] = await Promise.all([
+          loadA ? loadSingleParallelImage(loadA, maxWidth, maxHeight, skipCache) : null,
+          loadB ? loadSingleParallelImage(loadB, maxWidth, maxHeight, skipCache) : null,
+        ]);
+
+        setParallelImageA(imageA);
+        setParallelImageB(imageB);
+      } catch (err) {
+        console.error('Parallel image load error:', err);
+      }
+
+      setParallelLoading(false);
+
+      // 先読みは現在ページのレンダリング完了後に開始（リソース競合を回避）
+      const currentIdx = Math.max(parallelIndexA, parallelIndexB);
+      const direction = currentIdx >= prevParallelIndexRef.current ? 'forward' : 'backward';
+      prevParallelIndexRef.current = currentIdx;
+      preloadParallelImages(currentIdx, maxWidth, maxHeight, undefined, undefined, direction);
+    } else {
+      // PDF onlyの場合もnon-PDF用のstateをクリア
+      setParallelImageA(null);
+      setParallelImageB(null);
+
+      // PDF先読みはPDF useEffect側で現在ページ完了後に行うため、ここでは方向追跡のみ
+      const currentIdx = Math.max(parallelIndexA, parallelIndexB);
+      const direction = currentIdx >= prevParallelIndexRef.current ? 'forward' : 'backward';
+      prevParallelIndexRef.current = currentIdx;
+      const { maxWidth, maxHeight } = getParallelDisplaySize();
+      preloadParallelImages(currentIdx, maxWidth, maxHeight, undefined, undefined, direction);
+    }
+  }, [appMode, parallelFilesA, parallelFilesB, parallelIndexA, parallelIndexB, getParallelDisplaySize]);
+
+  // 単一画像の読み込み
+  const loadSingleParallelImage = async (
+    entry: ParallelFileEntry,
+    maxWidth: number,
+    maxHeight: number,
+    skipCache: boolean = false
+  ): Promise<string | null> => {
+    // PDFの場合はページ番号とspreadSideもキーに含める
+    const spreadSuffix = entry.spreadSide ? `:${entry.spreadSide}` : '';
+    const cacheKey = entry.type === 'pdf' && entry.pdfPage
+      ? `${entry.path}:page${entry.pdfPage}${spreadSuffix}:${maxWidth}x${maxHeight}`
+      : `${entry.path}:${maxWidth}x${maxHeight}`;
+
+    // PDF/image(JPEG/PNG)は更新処理をスキップ（キャッシュがあれば使用）
+    const shouldSkipRefresh = entry.type === 'pdf' || entry.type === 'image';
+    const useCache = !skipCache || shouldSkipRefresh;
+
+    // フロントエンドキャッシュチェック
+    if (useCache && parallelImageCache[cacheKey]) {
+      return parallelImageCache[cacheKey].imageUrl;
+    }
+
+    try {
+      if (entry.type === 'pdf' && entry.pdfFile && entry.pdfPage) {
+        // PDFページのレンダリング（見開き分割対応）
+        let dataUrl: string | null;
+        if (entry.spreadSide) {
+          // 見開き分割モード
+          const bitmapEntry = await pdfCache.renderSplitPageBitmap(entry.pdfFile, entry.pdfPage, entry.spreadSide);
+          if (!bitmapEntry) return null;
+          // ImageBitmapからDataURLを生成
+          const canvas = document.createElement('canvas');
+          canvas.width = bitmapEntry.width;
+          canvas.height = bitmapEntry.height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) return null;
+          ctx.drawImage(bitmapEntry.bitmap, 0, 0);
+          dataUrl = canvas.toDataURL('image/png');
+          canvas.width = 0;
+          canvas.height = 0;
+        } else {
+          dataUrl = await pdfCache.renderPage(entry.pdfFile, entry.pdfPage);
+        }
+        if (!dataUrl) return null;
+
+        setParallelImageCache(prev => ({
+          ...prev,
+          [cacheKey]: { imageUrl: dataUrl, width: 0, height: 0 }, // サイズは後で取得可能
+        }));
+        return dataUrl;
+      } else if (entry.type === 'psd') {
+        // PSDはRust側で処理 → tempファイルパスが返る
+        const result = await invoke<{ file_url: string; width: number; height: number }>('parse_psd', { path: entry.path });
+        const assetUrl = convertFileSrc(result.file_url);
+        setParallelImageCache(prev => ({
+          ...prev,
+          [cacheKey]: { imageUrl: assetUrl, width: result.width, height: result.height },
+        }));
+        return assetUrl;
+      } else {
+        // TIFF/PNG/JPGはRust側で高速処理 → tempファイルパスが返る
+        const result = await invoke<{
+          file_url: string;
+          width: number;
+          height: number;
+        }>('decode_and_resize_image', {
+          path: entry.path,
+          maxWidth,
+          maxHeight,
+        });
+
+        const assetUrl = convertFileSrc(result.file_url);
+        setParallelImageCache(prev => ({
+          ...prev,
+          [cacheKey]: { imageUrl: assetUrl, width: result.width, height: result.height },
+        }));
+        return assetUrl;
+      }
+    } catch (err) {
+      console.error('Image load error:', entry.path, err);
+      return null;
+    }
+  };
+
+  // 先読み処理（方向検知 + 優先度付き + PSD/PDF並列化）
+  const preloadParallelImages = useCallback(async (
+    currentIdx: number,
+    maxWidth: number,
+    maxHeight: number,
+    filesA: ParallelFileEntry[] = parallelFilesA,
+    filesB: ParallelFileEntry[] = parallelFilesB,
+    direction: 'forward' | 'backward' = 'forward'
+  ) => {
+    const preloadRange = 5;
+    // 優先度付きパスリスト（先頭が最優先）
+    const prioritizedPaths: string[] = [];
+    const prioritizedPsdPaths: string[] = [];
+    const prioritizedPdfEntries: { path: string; page: number; splitSide: string | null }[] = [];
+
+    // 方向に応じて優先側を先に処理（offset 1から順に、進行方向を優先）
+    for (let offset = 1; offset <= preloadRange; offset++) {
+      const primaryIdx = direction === 'forward' ? currentIdx + offset : currentIdx - offset;
+      const secondaryIdx = direction === 'forward' ? currentIdx - offset : currentIdx + offset;
+
+      // 優先方向（進行方向側）
+      for (const files of [filesA, filesB]) {
+        if (primaryIdx >= 0 && primaryIdx < files.length) {
+          const entry = files[primaryIdx];
+          if (entry.type === 'psd') {
+            if (!prioritizedPsdPaths.includes(entry.path)) prioritizedPsdPaths.push(entry.path);
+          } else if (entry.type === 'pdf' && entry.pdfPage) {
+            const key = `${entry.path}:${entry.pdfPage}:${entry.spreadSide || ''}`;
+            if (!prioritizedPdfEntries.some(e => `${e.path}:${e.page}:${e.splitSide || ''}` === key)) {
+              prioritizedPdfEntries.push({ path: entry.path, page: entry.pdfPage - 1, splitSide: entry.spreadSide || null });
+            }
+          } else {
+            if (!prioritizedPaths.includes(entry.path)) prioritizedPaths.push(entry.path);
+          }
+        }
+      }
+
+      // 逆方向
+      for (const files of [filesA, filesB]) {
+        if (secondaryIdx >= 0 && secondaryIdx < files.length) {
+          const entry = files[secondaryIdx];
+          if (entry.type === 'psd') {
+            if (!prioritizedPsdPaths.includes(entry.path)) prioritizedPsdPaths.push(entry.path);
+          } else if (entry.type === 'pdf' && entry.pdfPage) {
+            const key = `${entry.path}:${entry.pdfPage}:${entry.spreadSide || ''}`;
+            if (!prioritizedPdfEntries.some(e => `${e.path}:${e.page}:${e.splitSide || ''}` === key)) {
+              prioritizedPdfEntries.push({ path: entry.path, page: entry.pdfPage - 1, splitSide: entry.spreadSide || null });
+            }
+          } else {
+            if (!prioritizedPaths.includes(entry.path)) prioritizedPaths.push(entry.path);
+          }
+        }
+      }
+    }
+
+    // TIFF/PNG/JPGをRust側で並列先読み（優先度順のパスリスト）
+    if (prioritizedPaths.length > 0) {
+      invoke('preload_images', { paths: prioritizedPaths, maxWidth, maxHeight }).catch(console.error);
+    }
+
+    // PDFページをRust側で先読み → フロントエンドキャッシュ + ブラウザメモリにプリロード
+    for (const pdfEntry of prioritizedPdfEntries) {
+      const key = `${pdfEntry.path}:${pdfEntry.page}:${pdfEntry.splitSide || ''}`;
+      if (pdfUrlCacheRef.current[key]) continue; // 既にキャッシュ済み
+
+      invoke<{ src: string; width: number; height: number }>('render_pdf_page', {
+        path: pdfEntry.path,
+        page: pdfEntry.page,
+        dpi: 300.0,
+        splitSide: pdfEntry.splitSide,
+      }).then(result => {
+        const url = convertFileSrc(result.src);
+        pdfUrlCacheRef.current[key] = url;
+        // ブラウザの画像キャッシュにも事前読み込み（表示時に即描画される）
+        new Image().src = url;
+      }).catch(() => {});
+    }
+
+    // PSDを優先度順に先読み（バックグラウンド）
+    for (const path of prioritizedPsdPaths) {
+      const cacheKey = `${path}:${maxWidth}x${maxHeight}`;
+      if (parallelImageCache[cacheKey]) continue;
+
+      (async () => {
+        try {
+          const result = await invoke<{ file_url: string; width: number; height: number }>('parse_psd', { path });
+          const assetUrl = convertFileSrc(result.file_url);
+          setParallelImageCache(prev => ({
+            ...prev,
+            [cacheKey]: { imageUrl: assetUrl, width: result.width, height: result.height },
+          }));
+        } catch (err) {
+          console.error('PSD preload error:', path, err);
+        }
+      })();
+    }
+  }, [parallelFilesA, parallelFilesB, parallelImageCache]);
+
+  // フォルダ/PDF読み込み直後に先読みを即座に開始
+  useEffect(() => {
+    if (appMode !== 'parallel-view') return;
+    if (parallelFilesA.length === 0 && parallelFilesB.length === 0) return;
+
+    const { maxWidth, maxHeight } = getParallelDisplaySize();
+    // 現在位置から前後の画像を先読み（TIFF/PSD用）
+    preloadParallelImages(
+      Math.max(parallelIndexA, parallelIndexB),
+      maxWidth,
+      maxHeight,
+      parallelFilesA,
+      parallelFilesB
+    );
+  }, [parallelFilesA, parallelFilesB]); // ファイルリスト変更時のみ発火
+
+  // PDF全ページ一括バックグラウンドレンダリング（PDFロード時に全ページをキャッシュに入れる）
+  useEffect(() => {
+    if (appMode !== 'parallel-view') return;
+
+    // 全PDFエントリを収集（重複排除）
+    const pdfEntries: { path: string; page: number; splitSide: string | null; key: string }[] = [];
+    for (const files of [parallelFilesA, parallelFilesB]) {
+      for (const entry of files) {
+        if (entry.type === 'pdf' && entry.path && entry.pdfPage) {
+          const page = entry.pdfPage - 1;
+          const splitSide = entry.spreadSide || null;
+          const key = `${entry.path}:${page}:${splitSide || ''}`;
+          if (!pdfEntries.some(e => e.key === key)) {
+            pdfEntries.push({ path: entry.path, page, splitSide, key });
+          }
+        }
+      }
+    }
+    if (pdfEntries.length === 0) return;
+
+    let cancelled = false;
+
+    // 現在ページのレンダリング完了を待ってからバックグラウンド開始
+    (async () => {
+      await new Promise(r => setTimeout(r, 300));
+
+      // 2ページずつ並列でバックグラウンドレンダリング
+      for (let i = 0; i < pdfEntries.length; i += 2) {
+        if (cancelled) break;
+
+        const batch = pdfEntries.slice(i, i + 2).filter(e => !pdfUrlCacheRef.current[e.key]);
+        if (batch.length === 0) continue;
+
+        await Promise.all(batch.map(async (entry) => {
+          try {
+            const result = await invoke<{ src: string; width: number; height: number }>('render_pdf_page', {
+              path: entry.path,
+              page: entry.page,
+              dpi: 300.0,
+              splitSide: entry.splitSide,
+            });
+            if (cancelled) return;
+            const url = convertFileSrc(result.src);
+            pdfUrlCacheRef.current[entry.key] = url;
+            new Image().src = url; // ブラウザメモリにもプリロード
+          } catch { /* バックグラウンドなのでエラー無視 */ }
+        }));
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [appMode, parallelFilesA, parallelFilesB]);
+
+  // 並列ビューのインデックス変更時に画像を読み込み
+  useEffect(() => {
+    if (appMode === 'parallel-view') {
+      loadParallelImages();
+    }
+  }, [appMode, parallelIndexA, parallelIndexB, loadParallelImages]);
+
+  // 並列ビュークリア
+  const clearParallelView = () => {
+    setParallelFolderA(null);
+    setParallelFolderB(null);
+    setParallelFilesA([]);
+    setParallelFilesB([]);
+    setParallelCurrentIndex(0);
+    setParallelIndexA(0);
+    setParallelIndexB(0);
+    setParallelSyncMode(true);
+    setParallelActivePanel('A');
+    setParallelImageA(null);
+    setParallelImageB(null);
+    setParallelImageCache({});
+    setParallelCapturedImageA(null);
+    setParallelCapturedImageB(null);
+    pdfCache.clear(); // PDFキャッシュもクリア
+    invoke('clear_image_cache').catch(console.error);
+  };
+
+  // 差分モード更新（フォルダ再スキャン＋キャッシュクリア＋再処理）
+  const refreshDiffMode = useCallback(async () => {
+    if (appMode !== 'diff-check') return;
+
+    // キャッシュクリア
+    pdfCache.clear();
+    setDiffCache(prev => { cleanupPageCache(prev); return {}; });
+    await invoke('clear_image_cache').catch(console.error);
+
+    // フォルダパスが保存されている場合、フォルダを再スキャンしてファイルを更新
+    const extensionsA = getAcceptedExtensions('A').map(e => e.replace('.', ''));
+    const extensionsB = getAcceptedExtensions('B').map(e => e.replace('.', ''));
+
+    try {
+      // フォルダAを再スキャン
+      if (diffFolderA) {
+        const filePathsA = await invoke<string[]>('list_files_in_folder', {
+          path: diffFolderA,
+          extensions: extensionsA,
+        });
+        const filesFromA = await readFilesFromPaths(filePathsA);
+        const filteredA = filesFromA.filter(f => isAcceptedFile(f, 'A'));
+        setFilesA(filteredA.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })));
+      }
+
+      // フォルダBを再スキャン
+      if (diffFolderB) {
+        const filePathsB = await invoke<string[]>('list_files_in_folder', {
+          path: diffFolderB,
+          extensions: extensionsB,
+        });
+        const filesFromB = await readFilesFromPaths(filePathsB);
+        const filteredB = filesFromB.filter(f => isAcceptedFile(f, 'B'));
+        setFilesB(filteredB.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })));
+      }
+    } catch (err) {
+      console.error('Folder rescan error:', err);
+    }
+
+    // フォルダが設定されていない場合（従来の動作）は現在のペアを再処理
+    if (!diffFolderA && !diffFolderB) {
+      const pair = pairs[selectedIndex];
+      if (!pair || !pair.fileA || !pair.fileB) return;
+
+      // 現在のペアをpending状態に戻して再処理
+      setPairs(prev => {
+        const next = [...prev];
+        next[selectedIndex] = { ...next[selectedIndex], status: 'pending' };
+        return next;
+      });
+    }
+  }, [appMode, pairs, selectedIndex, diffFolderA, diffFolderB, getAcceptedExtensions, readFilesFromPaths, isAcceptedFile]);
+
+  // パラレルビュー更新（キャッシュクリア＋再読み込み）
+  const refreshParallelView = useCallback(() => {
+    if (appMode !== 'parallel-view') return;
+    if (parallelFilesA.length === 0 && parallelFilesB.length === 0) return;
+
+    // キャッシュクリア
+    setParallelImageCache({});
+    pdfCache.clear();
+    void invoke('clear_image_cache')
+      .then(() => loadParallelImages(true))
+      .catch(console.error);
+  }, [appMode, parallelFilesA.length, parallelFilesB.length, loadParallelImages]);
+
+  // MojiQ起動前のメモリ解放（重いPDFでのOut of Memoryエラー対策）
+  const releaseMemoryBeforeMojiQ = useCallback(() => {
+    // PDFキャッシュをクリア
+    pdfCache.clear();
+    // diffキャッシュをクリア
+    setDiffCache(prev => { cleanupPageCache(prev); return {}; });
+    // 並列ビューのイメージキャッシュをクリア
+    setParallelImageCache({});
+    // Rust側のイメージキャッシュをクリア
+    invoke('clear_image_cache').catch(console.error);
+  }, []);
+
+  // ============== フォルダを開く機能 ==============
+  // フォルダを開く
+  const openFolderInExplorer = useCallback(async (folderPath: string | null) => {
+    if (!folderPath) return;
+    try {
+      await invoke('kenban_open_folder', { path: folderPath });
+    } catch (err) {
+      console.error('Failed to open folder:', err);
+    }
+  }, []);
+
+  // ============== テキスト照合モード: ハンドラ ==============
+
+  // PSDフォルダ選択
+  const handleSelectTextVerifyFolder = useCallback(async () => {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: 'PSDフォルダを選択',
+      });
+      if (!selected || typeof selected !== 'string') return;
+
+      const files = await invoke<string[]>('list_files_in_folder', {
+        path: selected,
+        extensions: ['psd'],
+      });
+      if (files.length === 0) return;
+
+      const pages: TextVerifyPage[] = files.map((filePath, index) => {
+        const fileName = filePath.split(/[/\\]/).pop() || '';
+        return {
+          fileIndex: index,
+          fileName,
+          filePath,
+          imageSrc: null,
+          extractedText: '',
+          extractedLayers: [],
+          memoText: '',
+          diffResult: null,
+          status: 'pending' as const,
+          psdWidth: 0,
+          psdHeight: 0,
+          memoShared: false,
+          memoSharedGroup: [],
+        };
+      });
+
+      setTextVerifyPages(pages);
+      setTextVerifyCurrentIndex(0);
+
+      // メモが既に読み込まれていればマッチング
+      if (textVerifyMemoRaw) {
+        const { pages: memoPages, sharedPages } = parseMemo(textVerifyMemoRaw);
+        const updated = pages.map(page => {
+          const pageNum = matchPageToFile(page.fileName);
+          const memoText = pageNum !== null ? (memoPages.get(pageNum) || '') : '';
+          const memoSharedGroup = pageNum !== null ? (sharedPages.get(pageNum) || []) : [];
+          return { ...page, memoText, memoShared: memoSharedGroup.length > 0, memoSharedGroup };
+        });
+        setTextVerifyPages(updated);
+      }
+    } catch (err) {
+      console.error('Failed to select text verify folder:', err);
+    }
+  }, [textVerifyMemoRaw]);
+
+  // テキストメモファイル選択
+  const handleSelectTextVerifyMemo = useCallback(async () => {
+    const selected = await open({
+      title: 'テキストメモを選択',
+      filters: [{ name: 'テキストファイル', extensions: ['txt', 'text', 'csv'] }],
+    });
+    if (!selected || typeof selected !== 'string') return;
+
+    const bytes = await tauriReadFile(selected);
+    const decoder = new TextDecoder('utf-8');
+    const text = decoder.decode(bytes);
+    setTextVerifyMemoFilePath(selected);
+    setTextVerifyHasUnsavedChanges(false);
+    setTextVerifyUndoStack([]);
+    applyTextVerifyMemo(text);
+  }, []);
+
+  // テキストメモを適用
+  const applyTextVerifyMemo = useCallback((text: string) => {
+    setTextVerifyMemoRaw(text);
+    const parsed = parseMemo(text);
+    const { pages: memoPages, sharedPages } = parsed;
+    const sections = getUniqueMemoSections(parsed);
+    // メモセクションの正規化を事前計算
+    const preNormalized = sections.length > 0 ? preNormalizeSections(sections) : undefined;
+
+    setTextVerifyPages(prev => prev.map(page => {
+      const pageNum = matchPageToFile(page.fileName);
+      // ファイル名ベースのデフォルト割り当て
+      let memoText = pageNum !== null ? (memoPages.get(pageNum) || '') : '';
+      let memoSharedGroup = pageNum !== null ? (sharedPages.get(pageNum) || []) : [];
+
+      // 抽出済みページはコンテンツベースで最適セクションに上書き
+      if (page.extractedText && sections.length > 0) {
+        const normPsd = normalizeTextForComparison(page.extractedText);
+        const best = findBestMemoSection(normPsd, sections, preNormalized);
+        if (best && best.matchRatio > 0) {
+          memoText = best.text;
+          memoSharedGroup = best.pageNums;
+        }
+      }
+
+      return { ...page, memoText, memoShared: memoSharedGroup.length > 0, memoSharedGroup, diffResult: null, status: page.extractedText ? 'done' as const : page.status };
+    }));
+  }, []);
+
+  // クリップボードから貼り付け
+  const handlePasteTextVerifyMemo = useCallback(async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text.trim()) {
+        setTextVerifyMemoFilePath(null);
+        setTextVerifyHasUnsavedChanges(false);
+        setTextVerifyUndoStack([]);
+        applyTextVerifyMemo(text);
+      }
+    } catch {
+      // Clipboard API失敗
+    }
+  }, [applyTextVerifyMemo]);
+
+  // メモテキストのページ単位更新（編集機能）
+  const updatePageMemoText = useCallback((pageIndex: number, newMemoText: string) => {
+    const page = textVerifyPagesRef.current[pageIndex];
+    if (!page) return;
+    const pageNum = matchPageToFile(page.fileName);
+
+    // undo用: 変更前のrawを保存
+    setTextVerifyUndoStack(prev => [...prev.slice(-(UNDO_MAX - 1)), textVerifyMemoRaw]);
+
+    // raw memo再構築
+    if (pageNum !== null && textVerifyMemoRaw) {
+      const parsed = parseMemo(textVerifyMemoRaw);
+      const newRaw = replaceMemoSection(textVerifyMemoRaw, parsed.sections, pageNum, newMemoText);
+      setTextVerifyMemoRaw(newRaw);
+    }
+
+    // diff再計算
+    setTextVerifyPages(prev => prev.map((p, i) => {
+      if (i === pageIndex) {
+        const normPsd = normalizeTextForComparison(p.extractedText, true);
+        const normMemo = normalizeTextForComparison(newMemoText, true);
+        const newDiff = computeLineSetDiff(normPsd, normMemo);
+        return { ...p, memoText: newMemoText, diffResult: newDiff };
+      }
+      // 共有ページのmemoTextとdiffも同時更新
+      if (page.memoShared && p.memoSharedGroup.join(',') === page.memoSharedGroup.join(',') && p.extractedText) {
+        const normPsd2 = normalizeTextForComparison(p.extractedText, true);
+        const normMemo2 = normalizeTextForComparison(newMemoText, true);
+        const newDiff2 = computeLineSetDiff(normPsd2, normMemo2);
+        return { ...p, memoText: newMemoText, diffResult: newDiff2 };
+      }
+      return p;
+    }));
+    setTextVerifyHasUnsavedChanges(true);
+  }, [textVerifyMemoRaw]);
+
+  // Undo
+  const undoTextVerifyMemo = useCallback(() => {
+    if (textVerifyUndoStack.length === 0) return;
+    const prevRaw = textVerifyUndoStack[textVerifyUndoStack.length - 1];
+    setTextVerifyUndoStack(prev => prev.slice(0, -1));
+    applyTextVerifyMemo(prevRaw);
+  }, [textVerifyUndoStack, applyTextVerifyMemo]);
+
+  // メモファイル保存
+  const saveTextVerifyMemo = useCallback(async (): Promise<boolean> => {
+    if (!textVerifyMemoFilePath) return false;
+    try {
+      await invoke('write_text_file', { path: textVerifyMemoFilePath, content: textVerifyMemoRaw });
+      setTextVerifyHasUnsavedChanges(false);
+      return true;
+    } catch (err) {
+      console.error('Failed to save memo:', err);
+      return false;
+    }
+  }, [textVerifyMemoFilePath, textVerifyMemoRaw]);
+  saveTextVerifyMemoRef.current = saveTextVerifyMemo;
+
+  // クリア（未保存チェック付き）
+  const clearTextVerify = useCallback(async () => {
+    if (textVerifyHasUnsavedRef.current) {
+      if (textVerifyMemoFilePath) {
+        const save = await ask('テキストメモに未保存の変更があります。保存しますか？', {
+          title: 'KENBAN', kind: 'warning', okLabel: '保存して閉じる', cancelLabel: '保存しない',
+        });
+        if (save) await saveTextVerifyMemo();
+      } else {
+        const ok = await ask('テキストメモに未保存の変更があります。閉じますか？', {
+          title: 'KENBAN', kind: 'warning', okLabel: '閉じる', cancelLabel: 'キャンセル',
+        });
+        if (!ok) return;
+      }
+    }
+    setTextVerifyPages([]);
+    setTextVerifyCurrentIndex(0);
+    setTextVerifyMemoRaw('');
+    setTextVerifyMemoFilePath(null);
+    setTextVerifyHasUnsavedChanges(false);
+    setTextVerifyUndoStack([]);
+  }, [textVerifyMemoFilePath, saveTextVerifyMemo]);
+
+  // テキスト抽出 + 差分計算（全ページ自動処理、現在ページ優先）
+  // Web Worker でPSD解析をオフロードし、メインスレッドのフリーズとメモリ蓄積を防止
+  const textVerifyPagesRef = useRef(textVerifyPages);
+  textVerifyPagesRef.current = textVerifyPages;
+
+  // Worker処理はオフスレッドで完結するため、結果は即時state反映（バッチ不要）
+
+  useEffect(() => {
+    if (compareMode !== 'text-verify') return;
+    if (textVerifyPages.length === 0) return;
+    if (!textVerifyMemoRaw) return;
+
+    let cancelled = false;
+
+    // Worker経由のテキスト抽出（PSDバッファはTransferableで転送、メインスレッドから即解放）
+    const extractPage = async (idx: number) => {
+      if (cancelled) return;
+      const latestPages = textVerifyPagesRef.current;
+      const page = latestPages[idx];
+      if (!page || page.status !== 'pending') {
+        console.log(`[TextVerify] extractPage(${idx}) skipped: status=${page?.status}`);
+        return;
+      }
+
+      console.log(`[TextVerify] extractPage(${idx}) start: ${page.fileName}`);
+
+      setTextVerifyPages(prev => prev.map((p, i) =>
+        i === idx ? { ...p, status: 'loading' as const } : p
+      ));
+
+      try {
+        // 1. メインスレッドでファイルを読み込み
+        const fileBytes = await tauriReadFile(page.filePath);
+        if (cancelled) return;
+        // Uint8Arrayの背後のArrayBufferから必要な範囲だけコピーしてWorkerへ転送
+        const buffer = new ArrayBuffer(fileBytes.byteLength);
+        new Uint8Array(buffer).set(fileBytes);
+        // fileBytes への参照はここで切れる
+
+        // 2. 共有ページ用: グループ内の他ページの抽出済みテキストを収集
+        const latestPage = textVerifyPagesRef.current[idx];
+        let sharedGroupTexts: { pageNum: number; normPsd: string; pageIdx: number }[] | undefined;
+
+        if (latestPage?.memoShared) {
+          const allPages = textVerifyPagesRef.current;
+          const groupPages = allPages.filter(p =>
+            p.memoSharedGroup.join(',') === latestPage.memoSharedGroup.join(',')
+            && p.status === 'done' && p.extractedText
+          );
+          const expectedCount = latestPage.memoSharedGroup.length;
+          const doneCount = groupPages.length + 1;
+          if (doneCount >= expectedCount) {
+            sharedGroupTexts = [];
+            for (const pn of latestPage.memoSharedGroup) {
+              const pi = allPages.findIndex(p => matchPageToFile(p.fileName) === pn);
+              if (pi >= 0 && pi !== idx && allPages[pi].status === 'done') {
+                sharedGroupTexts.push({
+                  pageNum: pn,
+                  normPsd: normalizeTextForComparison(allPages[pi].extractedText, true),
+                  pageIdx: pi,
+                });
+              }
+            }
+          }
+        }
+
+        // 3. Worker に ArrayBuffer を Transferable で転送（ゼロコピー）
+        //    メインスレッドの buffer は即 detach されメモリ解放
+        console.log(`[TextVerify] extractPage(${idx}) sending to worker (${(buffer.byteLength / 1024 / 1024).toFixed(1)}MB)`);
+        const result = await workerExtractText(
+          buffer,
+          latestPage?.memoText || '',
+          latestPage?.memoShared || false,
+          latestPage?.memoSharedGroup || [],
+          idx,
+          sharedGroupTexts,
+        );
+
+        if (cancelled) return;
+        console.log(`[TextVerify] extractPage(${idx}) done: ${result.extractedLayers.length} layers`);
+
+        // 4. extractedLayersはキャッシュに保管（stateから分離してメモリ削減）
+        layerCacheRef.current.set(idx, result.extractedLayers);
+
+        const pageUpdate: Partial<TextVerifyPage> = {
+          extractedText: result.extractedText,
+          // 現在ページのみextractedLayersをstateに持つ（SVGオーバーレイ用）
+          extractedLayers: idx === textVerifyCurrentIndex ? result.extractedLayers : [],
+          psdWidth: result.psdWidth,
+          psdHeight: result.psdHeight,
+          diffResult: result.diffResult,
+          status: 'done' as const,
+        };
+
+        // Worker処理はオフスレッドなのでメインスレッド負荷は軽い → 全ページ即時反映
+        setTextVerifyPages(prev => prev.map((p, i) => {
+          if (i === idx) return { ...p, ...pageUpdate };
+          // 共有グループの他ページのdiffも更新
+          if (result.sharedGroupDiffs) {
+            const sharedDiff = result.sharedGroupDiffs.find(d => d.pageIdx === i);
+            if (sharedDiff) return { ...p, diffResult: sharedDiff.diff };
+          }
+          return p;
+        }));
+      } catch (err) {
+        if (cancelled) return;
+        console.error('Text verify processing error:', err);
+        setTextVerifyPages(prev => prev.map((p, i) =>
+          i === idx ? { ...p, status: 'error' as const, errorMessage: String(err) } : p
+        ));
+      }
+    };
+
+    // 全ページ抽出完了後、コンテンツベースでメモセクションを再割り当てしdiffを再計算（Worker経由）
+    const reassignMemoSections = async () => {
+      if (!textVerifyMemoRaw) return;
+      const parsed = parseMemo(textVerifyMemoRaw);
+      const sections = getUniqueMemoSections(parsed);
+      if (sections.length === 0) return;
+
+      const latestPages = textVerifyPagesRef.current;
+      const pagesToSend = latestPages
+        .map((page, idx) => ({
+          idx,
+          extractedText: page.extractedText,
+          memoText: page.memoText,
+          memoShared: page.memoShared,
+          memoSharedGroup: page.memoSharedGroup,
+          fileName: page.fileName,
+          status: page.status,
+        }))
+        .filter(p => p.status === 'done' && p.extractedText);
+
+      if (pagesToSend.length === 0) return;
+
+      try {
+        const result = await workerReassignDiffs(pagesToSend, sections);
+        if (cancelled || result.updates.length === 0) return;
+
+        setTextVerifyPages(prev => prev.map((page, idx) => {
+          const update = result.updates.find(u => u.idx === idx);
+          if (!update) return page;
+          return {
+            ...page,
+            memoText: update.memoText,
+            memoShared: update.memoShared,
+            memoSharedGroup: update.memoSharedGroup,
+            diffResult: update.diffResult,
+          };
+        }));
+      } catch (err) {
+        if (!cancelled) console.error('[TextVerify] reassignMemoSections worker error:', err);
+      }
+    };
+
+    const processAllPages = async () => {
+      console.log(`[TextVerify] processAllPages start: ${textVerifyPages.length} pages, currentIdx=${textVerifyCurrentIndex}`);
+
+      // 現在ページ最優先
+      await extractPage(textVerifyCurrentIndex);
+      if (cancelled) return;
+
+      // 残りを逐次処理（Worker内で処理するのでメモリ溢れない）
+      const rest = Array.from({ length: textVerifyPages.length }, (_, i) => i)
+        .filter(i => i !== textVerifyCurrentIndex);
+
+      for (const idx of rest) {
+        if (cancelled) return;
+        await extractPage(idx);
+      }
+
+      console.log(`[TextVerify] processAllPages complete`);
+      // 全ページ抽出完了: コンテンツベースでメモ再割り当て + diff再計算（Worker経由）
+      if (!cancelled) await reassignMemoSections();
+
+      // 全ページのプレビュー画像をバックグラウンドでプリフェッチ
+      // （現在ページ周辺は上のuseEffectで処理済み → 残りを順次取得してディスクキャッシュに保存）
+      if (!cancelled) {
+        const currentIdx = textVerifyCurrentIndex;
+        // 現在ページから近い順にソート
+        const allIndices = Array.from({ length: textVerifyPages.length }, (_, i) => i)
+          .sort((a, b) => Math.abs(a - currentIdx) - Math.abs(b - currentIdx));
+        for (const pi of allIndices) {
+          if (cancelled) break;
+          const p = textVerifyPagesRef.current[pi];
+          if (p?.status === 'done' && !p.imageSrc) {
+            await fetchPreview(pi);
+          }
+        }
+      }
+    };
+
+    processAllPages();
+    return () => {
+      cancelled = true;
+      cancelWorker();
+    };
+  }, [compareMode, textVerifyPages.length, textVerifyMemoRaw]);
+
+  // ページ切替時: キャッシュからextractedLayersを復元（現在ページのみstateに持つ）
+  useEffect(() => {
+    if (compareMode !== 'text-verify') return;
+    const idx = textVerifyCurrentIndex;
+    const page = textVerifyPages[idx];
+    if (!page || page.status !== 'done') return;
+    // 既にレイヤーが入っていればスキップ
+    if (page.extractedLayers.length > 0) return;
+    // キャッシュから復元
+    const cached = layerCacheRef.current.get(idx);
+    if (cached && cached.length > 0) {
+      setTextVerifyPages(prev => prev.map((p, i) => {
+        if (i === idx) return { ...p, extractedLayers: cached };
+        // 前のページのextractedLayersをクリアしてメモリ節約
+        if (p.extractedLayers.length > 0 && i !== idx) return { ...p, extractedLayers: [] };
+        return p;
+      }));
+    }
+  }, [textVerifyCurrentIndex, compareMode]);
+
+  // 画像のオンデマンド取得 + プリフェッチ
+  const currentPageStatus = textVerifyPages[textVerifyCurrentIndex]?.status;
+  const currentPageHasImage = !!textVerifyPages[textVerifyCurrentIndex]?.imageSrc;
+  const prefetchAbortRef = useRef(0); // インクリメントでプリフェッチチェーンをキャンセル
+
+  const fetchPreview = useCallback(async (idx: number): Promise<boolean> => {
+    const page = textVerifyPagesRef.current[idx];
+    if (!page || page.imageSrc || page.status !== 'done') return false;
+    try {
+      const result = await invoke<{ file_url: string; width: number; height: number }>('parse_psd', { path: page.filePath });
+      const assetUrl = convertFileSrc(result.file_url);
+      setTextVerifyPages(prev => prev.map((p, i) =>
+        i === idx ? { ...p, imageSrc: assetUrl } : p
+      ));
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  // 現在ページ: 即座に取得（デバウンスなし）
+  useEffect(() => {
+    if (compareMode !== 'text-verify') return;
+    if (currentPageHasImage) return;
+    if (currentPageStatus !== 'done') return;
+
+    const targetIdx = textVerifyCurrentIndex;
+    fetchPreview(targetIdx);
+  }, [textVerifyCurrentIndex, compareMode, currentPageStatus, currentPageHasImage, fetchPreview]);
+
+  // プリフェッチ: ±4ページを逐次先読み（ページ切替で即キャンセル）
+  useEffect(() => {
+    if (compareMode !== 'text-verify') return;
+    if (currentPageStatus !== 'done') return;
+
+    const generation = ++prefetchAbortRef.current;
+    const targetIdx = textVerifyCurrentIndex;
+
+    // 50msデバウンス（高速ページ送り対策、現在ページには影響しない）
+    const timer = setTimeout(async () => {
+      // ±4ページを優先度順にプリフェッチ
+      const prefetchOrder = [
+        targetIdx + 1, targetIdx - 1,
+        targetIdx + 2, targetIdx - 2,
+        targetIdx + 3, targetIdx - 3,
+        targetIdx + 4, targetIdx - 4,
+      ];
+      for (const pi of prefetchOrder) {
+        // ページ切替でキャンセル
+        if (prefetchAbortRef.current !== generation) return;
+        if (pi < 0 || pi >= textVerifyPagesRef.current.length) continue;
+        await fetchPreview(pi);
+      }
+
+      // 遠いページの画像を解放（±5 以遠）
+      if (prefetchAbortRef.current !== generation) return;
+      const currentIdx = textVerifyCurrentIndex;
+      setTextVerifyPages(prev => {
+        let changed = false;
+        const next = prev.map((p, i) => {
+          if (p.imageSrc && Math.abs(i - currentIdx) > 5) {
+            changed = true;
+            return { ...p, imageSrc: null };
+          }
+          return p;
+        });
+        return changed ? next : prev;
+      });
+    }, 50);
+
+    return () => clearTimeout(timer);
+  }, [textVerifyCurrentIndex, compareMode, currentPageStatus, fetchPreview]);
+
+  // メモ変更時に差分を再計算
+  useEffect(() => {
+    if (compareMode !== 'text-verify') return;
+    setTextVerifyPages(prev => {
+      // 共有グループを一括処理するためのキャッシュ
+      const groupDiffCache = new Map<string, Array<{ psd: DiffPart[]; memo: DiffPart[] }>>();
+      const groupPageIndices = new Map<string, number[]>();
+
+      // 共有グループの事前集計
+      for (let i = 0; i < prev.length; i++) {
+        const page = prev[i];
+        if (page.memoShared && page.status === 'done' && page.extractedText && page.memoText) {
+          const key = page.memoSharedGroup.join(',');
+          if (!groupPageIndices.has(key)) groupPageIndices.set(key, []);
+          groupPageIndices.get(key)!.push(i);
+        }
+      }
+
+      // 共有グループのdiffを一括計算
+      for (const [key, indices] of groupPageIndices) {
+        // ページ番号順にソート
+        const sorted = indices
+          .map(i => ({ idx: i, pageNum: matchPageToFile(prev[i].fileName) || 0 }))
+          .sort((a, b) => a.pageNum - b.pageNum);
+        const psdTexts = sorted.map(e => normalizeTextForComparison(prev[e.idx].extractedText, true));
+        const normMemo = normalizeTextForComparison(prev[indices[0]].memoText, true);
+        const diffs = computeSharedGroupDiff(psdTexts, normMemo);
+        // sorted順にマッピング
+        const diffMap = new Map<number, { psd: DiffPart[]; memo: DiffPart[] }>();
+        sorted.forEach((e, i) => diffMap.set(e.idx, diffs[i]));
+        groupDiffCache.set(key, diffs);
+        // indexからdiffへの直接マップを保存
+        for (const [pageIdx, diff] of diffMap) {
+          groupDiffCache.set(`idx:${pageIdx}`, [diff]);
+        }
+      }
+
+      return prev.map((page, idx) => {
+        if (page.status !== 'done' || !page.extractedText) return page;
+        if (!page.memoText) return { ...page, diffResult: null };
+
+        if (page.memoShared) {
+          const cached = groupDiffCache.get(`idx:${idx}`);
+          if (cached) return { ...page, diffResult: cached[0] };
+          // グループの他ページがまだdoneでない場合は単体版
+          const normPsd = normalizeTextForComparison(page.extractedText, true);
+          const normMemo = normalizeTextForComparison(page.memoText, true);
+          const singleDiffs = computeSharedGroupDiff([normPsd], normMemo);
+          return { ...page, diffResult: singleDiffs[0] };
+        }
+
+        const normPsd = normalizeTextForComparison(page.extractedText, true);
+        const normMemo = normalizeTextForComparison(page.memoText, true);
+        return { ...page, diffResult: computeLineSetDiff(normPsd, normMemo) };
+      });
+    });
+  }, [textVerifyMemoRaw, compareMode]);
+
+  // テキスト照合の統計（TextVerifyViewerにpropsとして渡す）
+  const textVerifyStats = useMemo(() => {
+    let matched = 0, mismatched = 0, pending = 0;
+    for (const p of textVerifyPages) {
+      if (p.status === 'done') {
+        if (p.diffResult && !p.diffResult.psd.some(d => d.removed) && !p.diffResult.memo.some(d => d.added)) {
+          matched++;
+        } else if (p.diffResult) {
+          mismatched++;
+        } else {
+          pending++;
+        }
+      } else if (p.status === 'pending' || p.status === 'loading') {
+        pending++;
+      }
+    }
+    return { matched, mismatched, pending, total: textVerifyPages.length };
+  }, [textVerifyPages]);
+
+  // 差分があるページのインデックスリスト
+  const textVerifyDiffPageIndices = useMemo(() => {
+    const indices: number[] = [];
+    for (let i = 0; i < textVerifyPages.length; i++) {
+      const p = textVerifyPages[i];
+      if (p.status === 'done' && p.diffResult &&
+        (p.diffResult.psd.some(d => d.removed && d.value.replace(/\n$/, '') !== '\u2063') ||
+         p.diffResult.memo.some(d => d.added && d.value.replace(/\n$/, '') !== '\u2063'))) {
+        indices.push(i);
+      }
+    }
+    return indices;
+  }, [textVerifyPages]);
+
+  // 全画面トランジション中フラグ（UI要素をCSSで収縮させる）
+  const [fullscreenTransitioning, setFullscreenTransitioning] = useState(false);
+
+  // 全画面トグル（バー収縮とウィンドウ拡大を同時に行い一つの動きに）
+  const toggleFullscreen = useCallback(async () => {
+    const window = getCurrentWebviewWindow();
+    const current = await window.isFullscreen();
+    const goingFullscreen = !current;
+
+    if (goingFullscreen) {
+      // バー収縮 + 全画面化を同時に開始 → 一つの滑らかな動き
+      setFullscreenTransitioning(true);
+      window.setFullscreen(true); // awaitしない＝同時進行
+      // CSS transition(300ms)とWindows側の遷移が並行で走る
+      await new Promise(r => setTimeout(r, 350));
+      setIsFullscreen(true);
+      setFullscreenTransitioning(false);
+      setShowFullscreenHint(true);
+      setTimeout(() => setShowFullscreenHint(false), 3000);
+    } else {
+      // 全画面解除 + バー展開を同時に開始
+      window.setFullscreen(false); // awaitしない
+      setIsFullscreen(false);
+      // CSS transitionでバーが展開される
+    }
+
+  }, []);
+
+  // 並列ビューの最大ページ数
+  const parallelMaxIndex = Math.max(parallelFilesA.length, parallelFilesB.length) - 1;
+
+  // 差分ガイドナビゲーション（差分ファイルのみスキップ移動）
+  const diffFileIndices = useMemo(() =>
+    pairs
+      .filter(p => (p.status === 'done' || p.status === 'checked') && p.hasDiff)
+      .map(p => p.index),
+    [pairs]
+  );
+  const diffNavPosition = useMemo(() => ({
+    current: diffFileIndices.indexOf(selectedIndex),
+    total: diffFileIndices.length,
+  }), [diffFileIndices, selectedIndex]);
+
+  const goNextDiffFile = useCallback(() => {
+    if (diffFileIndices.length === 0) return;
+    const nextIdx = diffFileIndices.find(i => i > selectedIndex);
+    if (nextIdx !== undefined) {
+      setSelectedIndex(nextIdx);
+    } else {
+      setSelectedIndex(diffFileIndices[0]);
+    }
+  }, [diffFileIndices, selectedIndex]);
+
+  const goPrevDiffFile = useCallback(() => {
+    if (diffFileIndices.length === 0) return;
+    const prevIndices = diffFileIndices.filter(i => i < selectedIndex);
+    if (prevIndices.length > 0) {
+      setSelectedIndex(prevIndices[prevIndices.length - 1]);
+    } else {
+      setSelectedIndex(diffFileIndices[diffFileIndices.length - 1]);
+    }
+  }, [diffFileIndices, selectedIndex]);
+
+  // キーボード操作
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // ScreenshotEditor（指示エディタ）が開いている場合は、そちらでキーイベントを処理させる
+      if (capturedImage || parallelCapturedImageA || parallelCapturedImageB) {
+        return;
+      }
+
+      // Ctrl+Q: アプリ終了
+      if (e.code === 'KeyQ' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        getCurrentWebviewWindow().close();
+        return;
+      }
+
+      // Ctrl+W: 開いているフォルダをクリア
+      if (e.code === 'KeyW' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        if (appMode === 'diff-check' && compareMode === 'text-verify') {
+          clearTextVerify();
+        } else if (appMode === 'diff-check') {
+          setFilesA([]);
+          setFilesB([]);
+          setPairs([]);
+          setCropBounds(null);
+          setPreloadProgress({ loaded: 0, total: 0 });
+          pdfCache.clear();
+        } else {
+          clearParallelView();
+        }
+        return;
+      }
+
+      // F11キー: 全画面トグル
+      if (e.code === 'F11') {
+        e.preventDefault();
+        toggleFullscreen();
+        return;
+      }
+
+      // Escapeキー: 全画面解除
+      if (e.code === 'Escape' && isFullscreen) {
+        e.preventDefault();
+        toggleFullscreen();
+        return;
+      }
+
+      // F5キー: 更新（キャッシュクリア＋再読み込み）※PDFモードでは無効
+      if (e.code === 'F5') {
+        e.preventDefault();
+        if (appMode === 'diff-check' && compareMode !== 'pdf-pdf') {
+          refreshDiffMode();
+        } else if (appMode === 'parallel-view') {
+          refreshParallelView();
+        }
+        return;
+      }
+
+      // Vキー: モード切り替え (diff-check ↔ parallel-view)
+      if (e.code === 'KeyV' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        if (appMode === 'diff-check') {
+          transferDiffToParallelView();
+          setAppMode('parallel-view');
+        } else if (appMode === 'parallel-view') {
+          setAppMode('diff-check');
+          setInitialModeSelect(false);
+        }
+        return;
+      }
+
+      // テキスト照合モードのキー操作
+      if (appMode === 'diff-check' && compareMode === 'text-verify') {
+        // テキスト編集中は矢印キー等をブラウザデフォルトに任せる
+        const tag = (e.target as HTMLElement)?.tagName;
+        if (tag === 'TEXTAREA' || tag === 'INPUT') return;
+        if (e.code === 'ArrowRight' || e.code === 'ArrowDown') {
+          e.preventDefault();
+          setTextVerifyCurrentIndex(prev => Math.min(prev + 1, textVerifyPages.length - 1));
+          return;
+        }
+        if (e.code === 'ArrowLeft' || e.code === 'ArrowUp') {
+          e.preventDefault();
+          setTextVerifyCurrentIndex(prev => Math.max(prev - 1, 0));
+          return;
+        }
+        if (e.code === 'Home') {
+          e.preventDefault();
+          setTextVerifyCurrentIndex(0);
+          return;
+        }
+        if (e.code === 'End') {
+          e.preventDefault();
+          setTextVerifyCurrentIndex(textVerifyPages.length - 1);
+          return;
+        }
+        // Pキー: Photoshopで開く
+        if (e.code === 'KeyP') {
+          const currentPage = textVerifyPages[textVerifyCurrentIndex];
+          if (currentPage?.filePath) {
+            e.preventDefault();
+            openInPhotoshop(currentPage.filePath);
+          }
+          return;
+        }
+      }
+
+      // 並列ビューモードのキー操作
+      if (appMode === 'parallel-view') {
+        // Sキー: 同期/非同期モード切り替え
+        if (e.code === 'KeyS' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          if (parallelSyncMode) {
+            // 同期→非同期: インデックスはそのまま維持
+            setParallelSyncMode(false);
+          } else {
+            if (e.shiftKey) {
+              // Shift+S: 元に戻して再同期（小さい方に合わせる）
+              const minIndex = Math.min(parallelIndexA, parallelIndexB);
+              setParallelIndexA(minIndex);
+              setParallelIndexB(minIndex);
+            }
+            // S: 現ページで再同期（インデックス維持）
+            setParallelSyncMode(true);
+          }
+          return;
+        }
+        // 非同期モードでTab/←→でアクティブパネル切り替え
+        if (!parallelSyncMode && (e.code === 'Tab' || e.code === 'ArrowLeft' || e.code === 'ArrowRight')) {
+          e.preventDefault();
+          setParallelActivePanel(prev => prev === 'A' ? 'B' : 'A');
+          return;
+        }
+        const maxIndexA = parallelFilesA.length - 1;
+        const maxIndexB = parallelFilesB.length - 1;
+        if (e.code === 'ArrowDown') {
+          e.preventDefault();
+          if (parallelSyncMode) {
+            // 同期モード: 両方のインデックスを同時に変更
+            setParallelIndexA(prev => Math.min(prev + 1, maxIndexA));
+            setParallelIndexB(prev => Math.min(prev + 1, maxIndexB));
+          } else {
+            // 非同期モード: ページめくり時にズームをリセット
+            if (parallelActivePanel === 'A') {
+              setParallelIndexA(prev => Math.min(prev + 1, maxIndexA));
+              setParallelZoomA(1);
+              setParallelPanA({ x: 0, y: 0 });
+            } else {
+              setParallelIndexB(prev => Math.min(prev + 1, maxIndexB));
+              setParallelZoomB(1);
+              setParallelPanB({ x: 0, y: 0 });
+            }
+          }
+          return;
+        }
+        if (e.code === 'ArrowUp') {
+          e.preventDefault();
+          if (parallelSyncMode) {
+            // 同期モード: 両方のインデックスを同時に変更
+            setParallelIndexA(prev => Math.max(prev - 1, 0));
+            setParallelIndexB(prev => Math.max(prev - 1, 0));
+          } else {
+            // 非同期モード: ページめくり時にズームをリセット
+            if (parallelActivePanel === 'A') {
+              setParallelIndexA(prev => Math.max(prev - 1, 0));
+              setParallelZoomA(1);
+              setParallelPanA({ x: 0, y: 0 });
+            } else {
+              setParallelIndexB(prev => Math.max(prev - 1, 0));
+              setParallelZoomB(1);
+              setParallelPanB({ x: 0, y: 0 });
+            }
+          }
+          return;
+        }
+        if (e.code === 'Home') {
+          e.preventDefault();
+          if (parallelSyncMode) {
+            // 同期モード: 両方のインデックスを同時に変更
+            setParallelIndexA(0);
+            setParallelIndexB(0);
+          } else {
+            // 非同期モード: ページめくり時にズームをリセット
+            if (parallelActivePanel === 'A') {
+              setParallelIndexA(0);
+              setParallelZoomA(1);
+              setParallelPanA({ x: 0, y: 0 });
+            } else {
+              setParallelIndexB(0);
+              setParallelZoomB(1);
+              setParallelPanB({ x: 0, y: 0 });
+            }
+          }
+          return;
+        }
+        if (e.code === 'End') {
+          e.preventDefault();
+          if (parallelSyncMode) {
+            // 同期モード: 両方のインデックスを同時に変更
+            setParallelIndexA(maxIndexA);
+            setParallelIndexB(maxIndexB);
+          } else {
+            // 非同期モード: ページめくり時にズームをリセット
+            if (parallelActivePanel === 'A') {
+              setParallelIndexA(maxIndexA);
+              setParallelZoomA(1);
+              setParallelPanA({ x: 0, y: 0 });
+            } else {
+              setParallelIndexB(maxIndexB);
+              setParallelZoomB(1);
+              setParallelPanB({ x: 0, y: 0 });
+            }
+          }
+          return;
+        }
+        // Cキー: 指示エディタを開く
+        if (e.code === 'KeyC') {
+          e.preventDefault();
+          if (parallelSyncMode) {
+            // 同期モード: アクティブパネルの画像を開く
+            if (parallelActivePanel === 'A' && parallelImageA) {
+              setParallelCapturedImageA(parallelImageA);
+            } else if (parallelActivePanel === 'B' && parallelImageB) {
+              setParallelCapturedImageB(parallelImageB);
+            }
+          } else {
+            // 非同期モード: アクティブパネルの画像を開く
+            if (parallelActivePanel === 'A' && parallelImageA) {
+              setParallelCapturedImageA(parallelImageA);
+            } else if (parallelActivePanel === 'B' && parallelImageB) {
+              setParallelCapturedImageB(parallelImageB);
+            }
+          }
+          return;
+        }
+        // Pキー: Photoshopで開く
+        if (e.code === 'KeyP') {
+          const fileA = parallelFilesA[parallelIndexA];
+          const fileB = parallelFilesB[parallelIndexB];
+          const hasPsdA = fileA?.type === 'psd';
+          const hasPsdB = fileB?.type === 'psd';
+
+          if (!hasPsdA && !hasPsdB) return;
+
+          e.preventDefault();
+          if (!parallelSyncMode) {
+            // 非同期モード: アクティブパネル側を直接開く
+            const file = parallelActivePanel === 'A' ? fileA : fileB;
+            if (file?.type === 'psd') {
+              openInPhotoshop(file.path);
+            }
+          } else {
+            // 同期モード: ポップアップ表示
+            setShowPsSelectPopup(true);
+          }
+          return;
+        }
+        // Qキー: MojiQでPDFを開く
+        if (e.code === 'KeyQ') {
+          const fileA = parallelFilesA[parallelIndexA];
+          const fileB = parallelFilesB[parallelIndexB];
+          const hasPdfA = fileA?.type === 'pdf';
+          const hasPdfB = fileB?.type === 'pdf';
+
+          if (!hasPdfA && !hasPdfB) return;
+
+          e.preventDefault();
+          // 非同期モードまたは片方のみPDFの場合は直接開く
+          if (!parallelSyncMode || !(hasPdfA && hasPdfB)) {
+            const file = parallelActivePanel === 'A' ? fileA : fileB;
+            if (file?.type === 'pdf') {
+              releaseMemoryBeforeMojiQ();
+              setTimeout(() => {
+                invoke('open_pdf_in_mojiq', { pdfPath: file.path, page: file.pdfPage || 1 })
+                  .catch((err: unknown) => {
+                    console.error('[MojiQ] Error:', err);
+                    alert(`MojiQの起動に失敗しました:\n${err}`);
+                  });
+              }, 100);
+            }
+          } else {
+            // 同期モードで両方PDFの場合はポップアップ
+            setShowMojiQSelectPopup(!showMojiQSelectPopup);
+          }
+          return;
+        }
+        // Ctrl+/-/0/;: 非同期モードでのズーム操作
+        if (e.ctrlKey && !parallelSyncMode) {
+          if (e.code === 'Equal' || e.code === 'NumpadAdd' || e.code === 'Semicolon' || e.key === ';') {
+            e.preventDefault();
+            if (parallelActivePanel === 'A') {
+              setParallelZoomA(z => Math.min(5, z * 1.25));
+            } else {
+              setParallelZoomB(z => Math.min(5, z * 1.25));
+            }
+            return;
+          } else if (e.code === 'Minus' || e.code === 'NumpadSubtract') {
+            e.preventDefault();
+            if (parallelActivePanel === 'A') {
+              setParallelZoomA(z => Math.max(0.1, z / 1.25));
+            } else {
+              setParallelZoomB(z => Math.max(0.1, z / 1.25));
+            }
+            return;
+          } else if (e.code === 'Digit0' || e.code === 'Numpad0') {
+            e.preventDefault();
+            if (parallelActivePanel === 'A') {
+              setParallelZoomA(1);
+              setParallelPanA({ x: 0, y: 0 });
+            } else {
+              setParallelZoomB(1);
+              setParallelPanB({ x: 0, y: 0 });
+            }
+            return;
+          }
+        }
+        return; // 並列ビューモードでは他のキーは無視
+      }
+
+      // 検版モードのキー操作
+      if (e.code === 'Space' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        setViewMode(prev => prev === 'diff' ? 'A' : 'diff');
+        return;
+      }
+      if (e.code === 'Space') {
+        e.preventDefault();
+        setViewMode(prev => prev === 'diff' ? 'A' : prev === 'A' ? 'B' : 'A');
+      }
+      // J/K: 差分ファイルのみナビゲーション
+      if (e.code === 'KeyJ' && compareMode !== 'text-verify') { e.preventDefault(); goNextDiffFile(); return; }
+      if (e.code === 'KeyK' && compareMode !== 'text-verify') { e.preventDefault(); goPrevDiffFile(); return; }
+      // PDF-PDFモードでは上下キーでページ移動
+      if (compareMode === 'pdf-pdf' && pairs[selectedIndex]?.status === 'done') {
+        const totalPages = pairs[selectedIndex]?.totalPages || 1;
+        if (e.code === 'ArrowDown') { e.preventDefault(); setCurrentPage(prev => Math.min(prev + 1, totalPages)); return; }
+        if (e.code === 'ArrowUp') { e.preventDefault(); setCurrentPage(prev => Math.max(prev - 1, 1)); return; }
+      }
+      // その他のモードでは上下キーでファイル選択
+      if (e.code === 'ArrowDown') { e.preventDefault(); setSelectedIndex(prev => Math.min(prev + 1, pairs.length - 1)); }
+      if (e.code === 'ArrowUp') { e.preventDefault(); setSelectedIndex(prev => Math.max(prev - 1, 0)); }
+      // Pキー: PSDモードでPhotoshopで開く
+      if (e.code === 'KeyP' && (compareMode === 'psd-psd' || compareMode === 'psd-tiff')) {
+        const currentPair = pairs[selectedIndex];
+        if (!currentPair) return;
+        let psdFile: FileWithPath | null = null;
+        if (viewMode === 'A' || viewMode === 'A-full') {
+          psdFile = currentPair.fileA as FileWithPath | null;
+        } else if (viewMode === 'B' && compareMode === 'psd-psd') {
+          psdFile = currentPair.fileB as FileWithPath | null;
+        }
+        if (psdFile?.filePath && psdFile.name.toLowerCase().endsWith('.psd')) {
+          e.preventDefault();
+          openInPhotoshop(psdFile.filePath);
+        }
+      }
+      // Qキー: PDF-PDFモードでMojiQで開く
+      if (e.code === 'KeyQ' && compareMode === 'pdf-pdf') {
+        const currentPair = pairs[selectedIndex];
+        if (!currentPair || currentPair.status !== 'done') return;
+        let pdfFile: FileWithPath | null = null;
+        if (viewMode === 'A' || viewMode === 'A-full' || viewMode === 'diff') {
+          pdfFile = currentPair.fileA as FileWithPath | null;
+        } else if (viewMode === 'B') {
+          pdfFile = currentPair.fileB as FileWithPath | null;
+        }
+        if (pdfFile?.filePath && pdfFile.name.toLowerCase().endsWith('.pdf')) {
+          e.preventDefault();
+          releaseMemoryBeforeMojiQ();
+          setTimeout(() => {
+            invoke('open_pdf_in_mojiq', { pdfPath: pdfFile.filePath, page: currentPage })
+              .catch((err: unknown) => {
+                console.error('[MojiQ] Error:', err);
+                alert(`MojiQの起動に失敗しました:\n${err}`);
+              });
+          }, 100);
+        } else if (pdfFile) {
+          console.warn('[MojiQ] App Q-key diff: filePath is undefined', { filePath: pdfFile?.filePath, name: pdfFile?.name });
+          alert('MojiQ連携エラー: PDFファイルのパスが取得できませんでした。ファイルを再読み込みしてください。');
+        }
+      }
+      // Cキー: 修正指示モード（即座にScreenshotEditorを開く）
+      if (e.code === 'KeyC' && pairs[selectedIndex]?.status === 'done') {
+        e.preventDefault();
+        const displayImg = (() => {
+          const pair = pairs[selectedIndex];
+          if (!pair) return null;
+          if (viewMode === 'diff') {
+            if (pair.diffSrcWithMarkers) return pair.diffSrcWithMarkers;
+            return pair.diffSrc;
+          }
+          if (viewMode === 'B') return pair.processedB;
+          if (viewMode === 'A-full') return pair.srcA;
+          return pair.processedA;
+        })();
+        if (displayImg) {
+          setCapturedImage(displayImg);
+        }
+      }
+      // Ctrl+/-/0/;: ズーム操作（検版モード）
+      if (e.ctrlKey) {
+        if (e.code === 'Equal' || e.code === 'NumpadAdd' || e.code === 'Semicolon' || e.key === ';') {
+          e.preventDefault();
+          setZoom(z => Math.min(5, z * 1.25));
+        } else if (e.code === 'Minus' || e.code === 'NumpadSubtract') {
+          e.preventDefault();
+          setZoom(z => Math.max(0.1, z / 1.25));
+        } else if (e.code === 'Digit0' || e.code === 'Numpad0') {
+          e.preventDefault();
+          setZoom(1);
+          setPanPosition({ x: 0, y: 0 });
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [pairs, selectedIndex, compareMode, viewMode, appMode, parallelMaxIndex, parallelSyncMode, parallelActivePanel, parallelCurrentIndex, parallelIndexA, parallelIndexB, parallelFilesA, parallelFilesB, parallelImageA, parallelImageB, transferDiffToParallelView, capturedImage, parallelCapturedImageA, parallelCapturedImageB, refreshDiffMode, refreshParallelView, toggleFullscreen, isFullscreen, clearParallelView, goNextDiffFile, goPrevDiffFile]);
+
+  // 表示画像取得
+  const currentPair = pairs[selectedIndex];
+
+  const getCurrentMarkers = () => {
+    if (!currentPair || currentPair.status !== 'done') return [];
+    if (compareMode === 'pdf-pdf') {
+      const cacheKey = `${selectedIndex}-${currentPage}`;
+      const pageData = diffCache[cacheKey];
+      return pageData?.markers || currentPair.markers || [];
+    }
+    return currentPair.markers || [];
+  };
+
+  const getDiffImage = () => {
+    if (!currentPair) return null;
+    if (showMarkers && currentPair.diffSrcWithMarkers) return currentPair.diffSrcWithMarkers;
+    return currentPair.diffSrc;
+  };
+
+  const getDisplayImage = (): string | null => {
+    if (!currentPair || currentPair.status !== 'done') return null;
+
+    // PDF-PDFモード: diffCacheからページごとのDataURLを取得
+    if (compareMode === 'pdf-pdf') {
+      const cacheKey = `${selectedIndex}-${currentPage}`;
+      const pageData = diffCache[cacheKey];
+      if (!pageData) return null;
+      if (viewMode === 'A' || viewMode === 'A-full') return pageData.srcA;
+      if (viewMode === 'B') return pageData.srcB;
+      return showMarkers && pageData.diffSrcWithMarkers ? pageData.diffSrcWithMarkers : pageData.diffSrc;
+    }
+
+    if (viewMode === 'A') return currentPair.processedA;
+    if (viewMode === 'A-full') return currentPair.srcA;
+    if (viewMode === 'B') return currentPair.processedB;
+    return getDiffImage();
+  };
+
+  const handleReset = useCallback(() => {
+    setSidebarCollapsed(true);
+    setInitialModeSelect(true);
+    setAppMode('diff-check');
+    setFilesA([]);
+    setFilesB([]);
+    setPairs([]);
+    setCropBounds(null);
+    setPreloadProgress({ loaded: 0, total: 0 });
+    setParallelFilesA([]);
+    setParallelFilesB([]);
+    setParallelFolderA(null);
+    setParallelFolderB(null);
+    setDiffCache(prev => { cleanupPageCache(prev); return {}; });
+    pdfCache.clear();
+    // テキスト照合モードのリセット
+    setCompareMode('tiff-tiff');
+    setTextVerifyPages([]);
+    setTextVerifyCurrentIndex(0);
+    setTextVerifyMemoRaw('');
+  }, []);
+
+  const handleClear = useCallback(() => {
+    setFilesA([]);
+    setFilesB([]);
+    setPairs([]);
+    setCropBounds(null);
+    setPreloadProgress({ loaded: 0, total: 0 });
+    pdfCache.clear();
+  }, []);
+
+  return (
+    <div className="h-screen flex flex-col bg-neutral-900 text-white font-sans select-none fullscreen-zoom-target">
+      {/* PDF最適化進捗オーバーレイ（MojiQと同じスタイル） */}
+      {optimizeProgress && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+          <div className="bg-neutral-800/95 backdrop-blur-md rounded-lg p-6 shadow-[0_8px_32px_rgba(0,0,0,0.5)] border border-white/[0.06] min-w-96">
+            <div className="flex items-center gap-3 mb-4">
+              <Loader2 className="animate-spin text-action" size={24} />
+              <span className="text-lg font-semibold">{optimizeProgress.message}</span>
+            </div>
+            <div className="text-sm text-neutral-400 mb-3 truncate" title={optimizeProgress.fileName}>
+              {optimizeProgress.fileName}
+            </div>
+            {/* プログレスバー */}
+            {optimizeProgress.total !== undefined && optimizeProgress.total > 0 && (
+              <>
+                <div className="w-full h-2 bg-neutral-700 rounded-full overflow-hidden mb-2">
+                  <div
+                    className="h-full bg-action transition-all duration-150 shadow-[0_0_8px_rgba(107,138,255,0.3)]"
+                    style={{ width: `${((optimizeProgress.current || 0) / optimizeProgress.total) * 100}%` }}
+                  />
+                </div>
+                <div className="text-sm text-neutral-300 text-center">
+                  {optimizeProgress.current || 0} / {optimizeProgress.total} ページ
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 更新ダイアログ */}
+      {updateDialogState && (
+        <div
+          className="fixed inset-0 flex items-center justify-center z-[10000]"
+          style={{ background: 'rgba(0, 0, 0, 0.6)', backdropFilter: 'blur(4px)' }}
+        >
+          <div
+            className="rounded-2xl p-8 text-center shadow-[0_8px_32px_rgba(0,0,0,0.5)] max-w-sm w-full mx-4"
+            style={{
+              background: '#24242c',
+              border: '1px solid rgba(255,255,255,0.10)',
+            }}
+          >
+            {/* 確認ダイアログ */}
+            {updateDialogState.type === 'confirm' && (
+              <>
+                <Download size={48} className="mx-auto mb-4 text-blue-400" />
+                <h3 className="text-lg font-semibold text-white mb-3">新しいバージョンがあります</h3>
+                <p className="text-sm text-gray-300 mb-1">
+                  v{updateDialogState.version} が利用可能です。
+                </p>
+                <p className="text-sm text-gray-400 mb-6">今すぐアップデートしますか？</p>
+                <div className="flex gap-3 justify-center">
+                  <button
+                    onClick={() => setUpdateDialogState(null)}
+                    className="px-6 py-2.5 rounded-lg text-sm text-gray-400 hover:text-gray-200 transition-all"
+                    style={{ border: '1px solid rgba(255,255,255,0.10)' }}
+                  >
+                    後で
+                  </button>
+                  <button
+                    onClick={handleUpdate}
+                    className="px-6 py-2.5 rounded-lg text-sm font-semibold text-white transition-all hover:shadow-lg"
+                    style={{
+                      background: 'rgba(107,138,255,0.15)',
+                      boxShadow: 'none',
+                    }}
+                  >
+                    アップデート
+                  </button>
+                </div>
+              </>
+            )}
+
+            {/* ダウンロード中 */}
+            {updateDialogState.type === 'downloading' && (
+              <>
+                <RefreshCw size={48} className="mx-auto mb-4 text-blue-400 animate-spin" />
+                <h3 className="text-lg font-semibold text-white mb-3">アップデート中...</h3>
+                <p className="text-sm text-gray-300">
+                  ダウンロードしています。<br />しばらくお待ちください。
+                </p>
+              </>
+            )}
+
+            {/* 完了 */}
+            {updateDialogState.type === 'complete' && (
+              <>
+                <CheckCircle size={48} className="mx-auto mb-4 text-green-400" />
+                <h3 className="text-lg font-semibold text-white mb-3">インストール完了</h3>
+                <p className="text-sm text-gray-300">アプリを再起動します...</p>
+              </>
+            )}
+
+            {/* エラー */}
+            {updateDialogState.type === 'error' && (
+              <>
+                <AlertTriangle size={48} className="mx-auto mb-4 text-red-400" />
+                <h3 className="text-lg font-semibold text-white mb-3">アップデート失敗</h3>
+                <p className="text-sm text-gray-400 mb-6">{updateDialogState.message}</p>
+                <button
+                  onClick={() => setUpdateDialogState(null)}
+                  className="px-6 py-2.5 rounded-lg text-sm font-semibold text-white transition-all"
+                  style={{
+                    background: 'rgba(107,138,255,0.15)',
+                  }}
+                >
+                  閉じる
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      <Header isFullscreen={isFullscreen} fullscreenTransitioning={fullscreenTransitioning} onReset={handleReset} easterEgg={easterEgg} />
+
+      <div className="flex-1 flex min-h-0">
+        <Sidebar
+          isFullscreen={isFullscreen}
+          fullscreenTransitioning={fullscreenTransitioning}
+          sidebarCollapsed={sidebarCollapsed}
+          setSidebarCollapsed={setSidebarCollapsed}
+          appMode={appMode}
+          setAppMode={setAppMode}
+          setInitialModeSelect={setInitialModeSelect}
+          transferDiffToParallelView={transferDiffToParallelView}
+          compareMode={compareMode}
+          modeLabels={modeLabels}
+          filesA={filesA}
+          filesB={filesB}
+          pairs={pairs}
+          selectedIndex={selectedIndex}
+          setSelectedIndex={setSelectedIndex}
+          cropBounds={cropBounds}
+          pairingMode={pairingMode}
+          setPairingMode={setPairingMode}
+          filterDiffOnly={filterDiffOnly}
+          setFilterDiffOnly={setFilterDiffOnly}
+          showMarkers={showMarkers}
+          setShowMarkers={setShowMarkers}
+          settingsOpen={settingsOpen}
+          setSettingsOpen={setSettingsOpen}
+          photoshopPath={photoshopPath}
+          handleSelectPhotoshopExecutable={handleSelectPhotoshopExecutable}
+          handleClearPhotoshopExecutable={handleClearPhotoshopExecutable}
+          currentPage={currentPage}
+          setCurrentPage={setCurrentPage}
+          handleModeChange={handleModeChange}
+          handleFilesAUpload={handleFilesAUpload}
+          handleFilesBUpload={handleFilesBUpload}
+          handleDragOver={handleDragOver}
+          handleDragEnter={handleDragEnter}
+          handleDrop={handleDrop}
+          handleDragLeave={handleDragLeave}
+          dragOverSide={dragOverSide}
+          setIsGDriveBrowserOpen={setIsGDriveBrowserOpen}
+          diffCache={diffCache}
+          pdfComputingPages={pdfComputingPages}
+          onClear={handleClear}
+          parallelFolderA={parallelFolderA}
+          parallelFolderB={parallelFolderB}
+          parallelFilesA={parallelFilesA}
+          parallelFilesB={parallelFilesB}
+          parallelCurrentIndex={parallelCurrentIndex}
+          parallelIndexA={parallelIndexA}
+          parallelIndexB={parallelIndexB}
+          parallelSyncMode={parallelSyncMode}
+          parallelActivePanel={parallelActivePanel}
+          setParallelIndexA={setParallelIndexA}
+          setParallelIndexB={setParallelIndexB}
+          setParallelCurrentIndex={setParallelCurrentIndex}
+          handleSelectParallelFolder={handleSelectParallelFolder}
+          handleSelectParallelPdf={handleSelectParallelPdf}
+          clearParallelView={clearParallelView}
+          fileListRef={fileListRef}
+          pageListRef={pageListRef}
+          parallelFileListRef={parallelFileListRef}
+          textVerifyPages={textVerifyPages}
+          textVerifyCurrentIndex={textVerifyCurrentIndex}
+          setTextVerifyCurrentIndex={setTextVerifyCurrentIndex}
+          textVerifyMemoRaw={textVerifyMemoRaw}
+          handleSelectTextVerifyFolder={handleSelectTextVerifyFolder}
+          handleSelectTextVerifyMemo={handleSelectTextVerifyMemo}
+          handlePasteTextVerifyMemo={handlePasteTextVerifyMemo}
+          clearTextVerify={clearTextVerify}
+          textVerifyFileListRef={textVerifyFileListRef}
+        />
+
+        {appMode === 'diff-check' && compareMode === 'text-verify' ? (
+          <TextVerifyViewer
+            pages={textVerifyPages}
+            currentIndex={textVerifyCurrentIndex}
+            setCurrentIndex={setTextVerifyCurrentIndex}
+            memoRaw={textVerifyMemoRaw}
+            toggleFullscreen={toggleFullscreen}
+            onPasteMemo={applyTextVerifyMemo}
+            dropPsdRef={textVerifyDropPsdRef}
+            dropMemoRef={textVerifyDropMemoRef}
+            dragOverSide={dragOverSide}
+            onSelectFolder={handleSelectTextVerifyFolder}
+            onSelectMemo={handleSelectTextVerifyMemo}
+            memoFilePath={textVerifyMemoFilePath}
+            hasUnsavedChanges={textVerifyHasUnsavedChanges}
+            canUndo={textVerifyUndoStack.length > 0}
+            onUpdatePageMemo={updatePageMemoText}
+            onSaveMemo={saveTextVerifyMemo}
+            onUndo={undoTextVerifyMemo}
+            stats={textVerifyStats}
+            diffPageIndices={textVerifyDiffPageIndices}
+            openInPhotoshop={openInPhotoshop}
+          />
+        ) : appMode === 'diff-check' ? (
+          <DiffViewer
+            isFullscreen={isFullscreen}
+            fullscreenTransitioning={fullscreenTransitioning}
+            pairs={pairs}
+            selectedIndex={selectedIndex}
+            compareMode={compareMode}
+            viewMode={viewMode}
+            setViewMode={setViewMode}
+            showMarkers={showMarkers}
+            currentPage={currentPage}
+            setCurrentPage={setCurrentPage}
+            showHelp={showHelp}
+            setShowHelp={setShowHelp}
+            zoom={zoom}
+            setZoom={setZoom}
+            panPosition={panPosition}
+            setPanPosition={setPanPosition}
+            isDragging={isDragging}
+            handleImageMouseDown={handleImageMouseDown}
+            handleImageMouseMove={handleImageMouseMove}
+            handleImageMouseUp={handleImageMouseUp}
+            handleImageDoubleClick={handleImageDoubleClick}
+            handleWheelPageTurn={handleWheelPageTurn}
+            getCurrentMarkers={getCurrentMarkers}
+            getDisplayImage={getDisplayImage}
+            getDiffImage={getDiffImage}
+            preloadProgress={preloadProgress}
+            isLoadingPage={isLoadingPage}
+            openFolderInExplorer={openFolderInExplorer}
+            setCapturedImage={setCapturedImage}
+            refreshDiffMode={refreshDiffMode}
+            toggleFullscreen={toggleFullscreen}
+            transferDiffToParallelView={transferDiffToParallelView}
+            imageContainerRef={imageContainerRef}
+            filesA={filesA}
+            filesB={filesB}
+            diffFolderA={diffFolderA}
+            diffFolderB={diffFolderB}
+            cropBounds={cropBounds}
+            dragOverSide={dragOverSide}
+            handleDragOver={handleDragOver}
+            handleDrop={handleDrop}
+            handleDragLeave={handleDragLeave}
+            handleFilesAUpload={handleFilesAUpload}
+            handleFilesBUpload={handleFilesBUpload}
+            isGDriveBrowserOpen={isGDriveBrowserOpen}
+            setIsGDriveBrowserOpen={setIsGDriveBrowserOpen}
+            initialModeSelect={initialModeSelect}
+            setInitialModeSelect={setInitialModeSelect}
+            handleModeChange={handleModeChange}
+            setAppMode={setAppMode}
+            handleDragEnter={handleDragEnter}
+            releaseMemoryBeforeMojiQ={releaseMemoryBeforeMojiQ}
+            setDragOverSide={setDragOverSide}
+            openInPhotoshop={openInPhotoshop}
+            dropZoneARef={dropZoneARef}
+            dropZoneBRef={dropZoneBRef}
+            dropZoneJsonRef={dropZoneJsonRef}
+            diffFileIndices={diffFileIndices}
+            diffNavPosition={diffNavPosition}
+            goNextDiffFile={goNextDiffFile}
+            goPrevDiffFile={goPrevDiffFile}
+          />
+        ) : (
+          <ParallelViewer
+            isFullscreen={isFullscreen}
+            fullscreenTransitioning={fullscreenTransitioning}
+            parallelFilesA={parallelFilesA}
+            parallelFilesB={parallelFilesB}
+            parallelFolderA={parallelFolderA}
+            parallelFolderB={parallelFolderB}
+            parallelSyncMode={parallelSyncMode}
+            parallelActivePanel={parallelActivePanel}
+            parallelCurrentIndex={parallelCurrentIndex}
+            parallelIndexA={parallelIndexA}
+            parallelIndexB={parallelIndexB}
+            setParallelCurrentIndex={setParallelCurrentIndex}
+            setParallelIndexA={setParallelIndexA}
+            setParallelIndexB={setParallelIndexB}
+            setParallelSyncMode={setParallelSyncMode}
+            setParallelActivePanel={setParallelActivePanel}
+            parallelImageA={parallelImageA}
+            parallelImageB={parallelImageB}
+            parallelLoading={parallelLoading}
+            parallelZoomA={parallelZoomA}
+            parallelZoomB={parallelZoomB}
+            parallelPanA={parallelPanA}
+            parallelPanB={parallelPanB}
+            setParallelZoomA={setParallelZoomA}
+            setParallelZoomB={setParallelZoomB}
+            setParallelPanA={setParallelPanA}
+            setParallelPanB={setParallelPanB}
+            handleParallelMouseDownA={handleParallelMouseDownA}
+            handleParallelMouseDownB={handleParallelMouseDownB}
+            handleParallelMouseMoveA={handleParallelMouseMoveA}
+            handleParallelMouseMoveB={handleParallelMouseMoveB}
+            handleParallelMouseUpA={handleParallelMouseUpA}
+            handleParallelMouseUpB={handleParallelMouseUpB}
+            isDraggingParallelA={isDraggingParallelA}
+            isDraggingParallelB={isDraggingParallelB}
+            spreadSplitModeA={spreadSplitModeA}
+            spreadSplitModeB={spreadSplitModeB}
+            firstPageSingleA={firstPageSingleA}
+            firstPageSingleB={firstPageSingleB}
+            setSpreadSplitModeA={setSpreadSplitModeA}
+            setSpreadSplitModeB={setSpreadSplitModeB}
+            setFirstPageSingleA={setFirstPageSingleA}
+            setFirstPageSingleB={setFirstPageSingleB}
+            showSyncOptions={showSyncOptions}
+            showPsSelectPopup={showPsSelectPopup}
+            showMojiQSelectPopup={showMojiQSelectPopup}
+            showFolderSelectPopup={showFolderSelectPopup}
+            setShowSyncOptions={setShowSyncOptions}
+            setShowPsSelectPopup={setShowPsSelectPopup}
+            setShowMojiQSelectPopup={setShowMojiQSelectPopup}
+            setShowFolderSelectPopup={setShowFolderSelectPopup}
+            instructionButtonsHidden={instructionButtonsHidden}
+            setInstructionButtonsHidden={setInstructionButtonsHidden}
+            openFolderInExplorer={openFolderInExplorer}
+            toggleFullscreen={toggleFullscreen}
+            setParallelCapturedImageA={setParallelCapturedImageA}
+            setParallelCapturedImageB={setParallelCapturedImageB}
+            handleParallelDrop={handleParallelDrop}
+            handleSelectParallelFolder={handleSelectParallelFolder}
+            handleSelectParallelPdf={handleSelectParallelPdf}
+            parallelPdfImageA={parallelPdfImageA}
+            parallelPdfImageB={parallelPdfImageB}
+            parallelMaxIndex={parallelMaxIndex}
+            releaseMemoryBeforeMojiQ={releaseMemoryBeforeMojiQ}
+            expandPdfToParallelEntries={expandPdfToParallelEntries}
+            refreshParallelView={refreshParallelView}
+            openInPhotoshop={openInPhotoshop}
+            showHelp={showHelp}
+            setShowHelp={setShowHelp}
+            parallelDropZoneARef={parallelDropZoneARef}
+            parallelDropZoneBRef={parallelDropZoneBRef}
+            tauriDragOverSide={dragOverSide}
+          />
+        )}
+      </div>
+
+      <GDriveFolderBrowser
+        isOpen={isGDriveBrowserOpen}
+        onClose={() => setIsGDriveBrowserOpen(false)}
+        onJsonSelect={(bounds, fileName) => {
+          setCropBounds(bounds);
+          setIsGDriveBrowserOpen(false);
+          console.log('JSON読み込み完了:', fileName);
+        }}
+      />
+
+      {capturedImage && (
+        <ScreenshotEditor
+          imageData={capturedImage}
+          onClose={() => setCapturedImage(null)}
+        />
+      )}
+
+      {/* 並列ビューモード用の指示エディタ (A) */}
+      {parallelCapturedImageA && (
+        <ScreenshotEditor
+          imageData={parallelCapturedImageA}
+          onClose={() => setParallelCapturedImageA(null)}
+        />
+      )}
+
+      {/* 並列ビューモード用の指示エディタ (B) */}
+      {parallelCapturedImageB && (
+        <ScreenshotEditor
+          imageData={parallelCapturedImageB}
+          onClose={() => setParallelCapturedImageB(null)}
+        />
+      )}
+
+      {/* 全画面ヒントポップアップ（Portal経由でbody直下にレンダリング） */}
+      {createPortal(
+        <div
+          style={{
+            position: 'fixed',
+            top: '60px',
+            left: '50%',
+            transform: `translateX(-50%) translateY(${showFullscreenHint ? '0' : '-20px'})`,
+            zIndex: 99999,
+            pointerEvents: 'none',
+            opacity: showFullscreenHint ? 1 : 0,
+            transition: 'opacity 0.4s ease, transform 0.4s ease',
+          }}
+        >
+          <div
+            style={{
+              backgroundColor: 'rgba(0, 0, 0, 0.85)',
+              color: '#fff',
+              padding: '12px 24px',
+              borderRadius: '8px',
+              fontSize: '16px',
+              fontWeight: 500,
+              whiteSpace: 'nowrap',
+              boxShadow: '0 4px 20px rgba(0, 0, 0, 0.5)',
+            }}
+          >
+            ESCで解除
+          </div>
+        </div>,
+        document.body
+      )}
+    </div>
+  );
+}

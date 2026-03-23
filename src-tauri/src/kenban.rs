@@ -1,0 +1,1760 @@
+// ============================================================
+// KENBAN module - merged from KENBAN's lib.rs
+// All tauri commands are pub and prefixed where needed to avoid
+// conflicts with COMIC-Bridge's own commands.
+// ============================================================
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use image::{ImageBuffer, Rgba, DynamicImage, GenericImageView};
+use image::imageops::FilterType;
+use psd::Psd;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::Cursor;
+use std::panic;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::collections::{HashMap, VecDeque};
+use tauri::State;
+
+use pdfium_render::prelude::*;
+
+// ============== 画像キャッシュ ==============
+pub struct CachedImage {
+    file_path: String,  // temp JPEG ファイルパス
+    width: u32,
+    height: u32,
+    original_width: u32,
+    original_height: u32,
+}
+
+pub struct ImageCache {
+    cache: HashMap<String, CachedImage>,
+    order: VecDeque<String>,
+    max_size: usize,
+}
+
+impl ImageCache {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            cache: HashMap::new(),
+            order: VecDeque::new(),
+            max_size,
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&CachedImage> {
+        self.cache.get(key)
+    }
+
+    pub fn insert(&mut self, key: String, image: CachedImage) {
+        // LRUキャッシュ: 古いものを削除
+        if self.cache.len() >= self.max_size {
+            if let Some(oldest) = self.order.pop_front() {
+                self.cache.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.cache.insert(key, image);
+    }
+
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.order.clear();
+    }
+}
+
+// KENBAN用のAppState（COMIC-BridgeのAppStateに統合される）
+pub struct KenbanState {
+    pub image_cache: Mutex<ImageCache>,
+    pub cli_args: Vec<String>,
+}
+
+// ============== tempファイルヘルパー ==============
+
+/// キャッシュキーからハッシュベースのファイル名を生成
+pub fn cache_key_to_filename(cache_key: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    cache_key.hash(&mut hasher);
+    let hash = hasher.finish();
+    format!("kenban_preview_{:016x}.jpg", hash)
+}
+
+pub fn versioned_path_key(path: &str) -> String {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let len = metadata.len();
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            format!("{}:{}:{}", path, len, modified)
+        }
+        Err(_) => path.to_string(),
+    }
+}
+
+/// temp ディレクトリ内の kenban_preview サブフォルダを取得（なければ作成）
+pub fn get_kenban_temp_dir() -> Result<PathBuf, String> {
+    let temp = std::env::temp_dir().join("kenban_preview");
+    if !temp.exists() {
+        fs::create_dir_all(&temp)
+            .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+    }
+    Ok(temp)
+}
+
+/// DynamicImage を JPEG 85% で temp ファイルに書き出し、パスを返す
+/// 既にファイルが存在すればスキップ（ディスクキャッシュヒット）
+pub fn write_image_to_temp(img: &DynamicImage, cache_key: &str) -> Result<(String, u32, u32), String> {
+    let temp_dir = get_kenban_temp_dir()?;
+    let filename = cache_key_to_filename(cache_key);
+    let file_path = temp_dir.join(&filename);
+
+    let (w, h) = img.dimensions();
+
+    // 既にファイルが存在すればスキップ
+    if file_path.exists() {
+        return Ok((file_path.to_string_lossy().to_string(), w, h));
+    }
+
+    // RGBA → RGB 変換して JPEG エンコード
+    let rgb_img = DynamicImage::ImageRgb8(img.to_rgb8());
+    let mut jpeg_data = Cursor::new(Vec::new());
+    rgb_img.write_to(&mut jpeg_data, image::ImageFormat::Jpeg)
+        .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+
+    // アトミック書き込み（一時ファイル→リネーム）
+    let tmp_path = temp_dir.join(format!("{}.tmp", filename));
+    fs::write(&tmp_path, jpeg_data.get_ref())
+        .map_err(|e| format!("Failed to write temp file: {}", e))?;
+    fs::rename(&tmp_path, &file_path)
+        .map_err(|e| format!("Failed to rename temp file: {}", e))?;
+
+    Ok((file_path.to_string_lossy().to_string(), w, h))
+}
+
+// ============== 画像処理結果 ==============
+#[derive(Serialize)]
+pub struct KenbanImageResult {
+    file_url: String,  // temp JPEG ファイルパス（フロントでasset://に変換）
+    width: u32,
+    height: u32,
+    original_width: u32,
+    original_height: u32,
+}
+
+// PSD解析結果
+#[derive(Serialize)]
+pub struct KenbanPsdImageResult {
+    file_url: String,  // temp JPEG ファイルパス
+    width: u32,
+    height: u32,
+}
+
+// PSDファイルをパースしてtemp JPEGに書き出し、パスを返す
+#[tauri::command]
+pub fn kenban_parse_psd(path: String) -> Result<KenbanPsdImageResult, String> {
+    let cache_key = format!("psd_v2:{}", versioned_path_key(&path));
+
+    // ディスクキャッシュチェック
+    let temp_dir = get_kenban_temp_dir()?;
+    let filename = cache_key_to_filename(&cache_key);
+    let file_path = temp_dir.join(&filename);
+    if file_path.exists() {
+        let (w, h) = image::image_dimensions(&file_path)
+            .map_err(|e| format!("Failed to read image dimensions: {}", e))?;
+        return Ok(KenbanPsdImageResult {
+            file_url: file_path.to_string_lossy().to_string(),
+            width: w,
+            height: h,
+        });
+    }
+
+    let bytes = fs::read(&path).map_err(|e| format!("Failed to read file: {}", e))?;
+
+    let img = decode_psd_robust(&bytes)?;
+    drop(bytes);
+
+    let (file_path_str, w, h) = write_image_to_temp(&img, &cache_key)?;
+    Ok(KenbanPsdImageResult { file_url: file_path_str, width: w, height: h })
+}
+
+// ファイルをシステムのデフォルトアプリで開く
+#[tauri::command]
+pub fn kenban_open_file_with_default_app(path: String) -> Result<(), String> {
+    open::that(&path).map_err(|e| format!("Failed to open file: {}", e))
+}
+
+pub fn find_photoshop_path() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    let add_adobe_candidates = |base: &Path, out: &mut Vec<PathBuf>| {
+        let adobe_dir = base.join("Adobe");
+        if let Ok(entries) = std::fs::read_dir(&adobe_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                if name.contains("photoshop") {
+                    out.push(path.join("Photoshop.exe"));
+                }
+            }
+        }
+    };
+
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        add_adobe_candidates(Path::new(&program_files), &mut candidates);
+    }
+
+    if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+        add_adobe_candidates(Path::new(&program_files_x86), &mut candidates);
+    }
+
+    if let Some(local_app_data) = dirs::data_local_dir() {
+        candidates.push(
+            local_app_data
+                .join("Programs")
+                .join("Adobe")
+                .join("Adobe Photoshop")
+                .join("Photoshop.exe"),
+        );
+    }
+
+    for path in candidates {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+#[tauri::command]
+pub fn kenban_open_file_in_photoshop(path: String, photoshop_path: Option<String>) -> Result<(), String> {
+    let photoshop_path = photoshop_path
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(find_photoshop_path)
+        .ok_or_else(|| {
+            "Photoshop.exe が見つかりません。設定から Photoshop.exe を選択してください。"
+                .to_string()
+        })?;
+
+    if !photoshop_path.exists() {
+        return Err(format!(
+            "指定された Photoshop.exe が存在しません: {}",
+            photoshop_path.display()
+        ));
+    }
+
+    std::process::Command::new(&photoshop_path)
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("Failed to launch Photoshop: {}", e))?;
+
+    Ok(())
+}
+
+// スクリーンショット保存結果
+#[derive(Serialize)]
+pub struct KenbanSaveScreenshotResult {
+    file_path: String,
+    folder_path: String,
+}
+
+// スクリーンショットを保存
+#[tauri::command]
+pub fn kenban_save_screenshot(image_data: String, file_name: String) -> Result<KenbanSaveScreenshotResult, String> {
+    // デスクトップパスを取得
+    let desktop = dirs::desktop_dir()
+        .ok_or_else(|| "Failed to get desktop path".to_string())?;
+
+    // 保存先フォルダを作成
+    let folder_path = desktop.join("Script_Output").join("検版ツール");
+    fs::create_dir_all(&folder_path)
+        .map_err(|e| format!("Failed to create folder: {}", e))?;
+
+    // ファイル名を生成（拡張子を.pngに変更）
+    let base_name = PathBuf::from(&file_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "screenshot".to_string());
+
+    // 重複回避のためタイムスタンプを追加
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let final_name = format!("{}_{}.png", base_name, timestamp);
+    let file_path = folder_path.join(&final_name);
+
+    // Base64デコード（data:image/png;base64, プレフィックスを除去）
+    let base64_data = image_data
+        .strip_prefix("data:image/png;base64,")
+        .unwrap_or(&image_data);
+    let image_bytes = STANDARD.decode(base64_data)
+        .map_err(|e| format!("Failed to decode base64: {}", e))?;
+
+    // ファイルに保存
+    fs::write(&file_path, image_bytes)
+        .map_err(|e| format!("Failed to write file: {}", e))?;
+
+    Ok(KenbanSaveScreenshotResult {
+        file_path: file_path.to_string_lossy().to_string(),
+        folder_path: folder_path.to_string_lossy().to_string(),
+    })
+}
+
+// フォルダをエクスプローラーで開く
+#[tauri::command]
+pub fn kenban_open_folder(path: String) -> Result<(), String> {
+    open::that(&path).map_err(|e| format!("Failed to open folder: {}", e))
+}
+
+// MojiQのパスを探す
+pub fn find_mojiq_path() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1. Program Files
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        candidates.push(PathBuf::from(&program_files).join("MojiQ").join("MojiQ.exe"));
+    }
+
+    // 2. Program Files (x86)
+    if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+        candidates.push(PathBuf::from(&program_files_x86).join("MojiQ").join("MojiQ.exe"));
+    }
+
+    // 3. ユーザーのLocalAppData\Programs（Electronのデフォルト）
+    if let Some(local_app_data) = dirs::data_local_dir() {
+        candidates.push(local_app_data.join("Programs").join("MojiQ").join("MojiQ.exe"));
+        candidates.push(local_app_data.join("Programs").join("mojiq").join("MojiQ.exe"));
+    }
+
+    // 4. デスクトップ > MojiQ（開発用）
+    if let Some(desktop) = dirs::desktop_dir() {
+        candidates.push(desktop.join("MojiQ").join("dist").join("win-unpacked").join("MojiQ.exe"));
+        // バージョン付きフォルダ（ver_X.XX\MojiQ）もスキャン
+        if let Ok(entries) = std::fs::read_dir(&desktop) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("ver_") {
+                    candidates.push(entry.path().join("MojiQ").join("dist").join("win-unpacked").join("MojiQ.exe"));
+                }
+            }
+        }
+    }
+
+    // 最初に見つかったパスを返す
+    for path in candidates {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+// MojiQでPDFを開く（ページ指定付き）
+#[tauri::command]
+pub fn open_pdf_in_mojiq(pdf_path: String, page: Option<u32>) -> Result<(), String> {
+    println!("[MojiQ] open_pdf_in_mojiq called: pdf_path={}, page={:?}", pdf_path, page);
+
+    // MojiQ.exeのパスを探す
+    let mojiq_path = find_mojiq_path()
+        .ok_or_else(|| "MojiQ.exe が見つかりません。MojiQをインストールしてください。".to_string())?;
+
+    println!("[MojiQ] Found MojiQ at: {:?}", mojiq_path);
+
+    let mut cmd = std::process::Command::new(&mojiq_path);
+
+    if let Some(p) = page {
+        cmd.arg("--page");
+        cmd.arg(p.to_string());
+    }
+    cmd.arg(&pdf_path);
+
+    cmd.spawn().map_err(|e| format!("Failed to launch MojiQ: {}", e))?;
+
+    Ok(())
+}
+
+// ============== 並列ビューモード用の高速画像処理 ==============
+
+// 画像をリサイズして temp JPEG に書き出し、パスを返す（内部ヘルパー）
+pub fn resize_and_write_to_temp(img: &DynamicImage, max_width: u32, max_height: u32, cache_key: &str) -> Result<(String, u32, u32), String> {
+    let (orig_w, orig_h) = img.dimensions();
+
+    // アスペクト比を保ちながらリサイズ
+    let scale_w = max_width as f64 / orig_w as f64;
+    let scale_h = max_height as f64 / orig_h as f64;
+    let scale = scale_w.min(scale_h).min(1.0); // 拡大はしない
+
+    if scale < 1.0 {
+        let new_w = (orig_w as f64 * scale).round() as u32;
+        let new_h = (orig_h as f64 * scale).round() as u32;
+        let resized = img.resize(new_w, new_h, FilterType::Triangle);
+        write_image_to_temp(&resized, cache_key)
+    } else {
+        write_image_to_temp(img, cache_key)
+    }
+}
+
+// TIFF/PNG/JPG画像をデコード+リサイズして返す（3層キャッシュ: メモリ→ディスク→生成）
+#[tauri::command]
+pub fn decode_and_resize_image(
+    state: State<'_, KenbanState>,
+    path: String,
+    max_width: u32,
+    max_height: u32,
+) -> Result<KenbanImageResult, String> {
+    let cache_key = format!("{}:{}x{}", versioned_path_key(&path), max_width, max_height);
+
+    // 1. メモリキャッシュチェック
+    {
+        let cache = state.image_cache.lock().map_err(|e| e.to_string())?;
+        if let Some(cached) = cache.get(&cache_key) {
+            // ファイルがまだ存在するか確認
+            if PathBuf::from(&cached.file_path).exists() {
+                return Ok(KenbanImageResult {
+                    file_url: cached.file_path.clone(),
+                    width: cached.width,
+                    height: cached.height,
+                    original_width: cached.original_width,
+                    original_height: cached.original_height,
+                });
+            }
+            // ファイルが消えていたらキャッシュを無効化（下で再生成）
+        }
+    }
+
+    // 2. ディスクキャッシュチェック（tempファイル存在確認）
+    let temp_dir = get_kenban_temp_dir()?;
+    let filename = cache_key_to_filename(&cache_key);
+    let file_path = temp_dir.join(&filename);
+    if file_path.exists() {
+        let (w, h) = image::image_dimensions(&file_path)
+            .map_err(|e| format!("Failed to read image dimensions: {}", e))?;
+        let file_path_str = file_path.to_string_lossy().to_string();
+
+        // 元画像サイズも取得
+        let (orig_w, orig_h) = image::image_dimensions(&path)
+            .unwrap_or((w, h));
+
+        let mut cache = state.image_cache.lock().map_err(|e| e.to_string())?;
+        cache.insert(cache_key.clone(), CachedImage {
+            file_path: file_path_str.clone(),
+            width: w,
+            height: h,
+            original_width: orig_w,
+            original_height: orig_h,
+        });
+        return Ok(KenbanImageResult {
+            file_url: file_path_str,
+            width: w,
+            height: h,
+            original_width: orig_w,
+            original_height: orig_h,
+        });
+    }
+
+    // 3. フルデコード → temp書き出し → キャッシュ登録
+    let img = image::open(&path)
+        .map_err(|e| format!("Failed to open image: {}", e))?;
+    let (orig_w, orig_h) = img.dimensions();
+
+    let (file_path_str, new_w, new_h) = resize_and_write_to_temp(&img, max_width, max_height, &cache_key)?;
+
+    let mut cache = state.image_cache.lock().map_err(|e| e.to_string())?;
+    cache.insert(cache_key, CachedImage {
+        file_path: file_path_str.clone(),
+        width: new_w,
+        height: new_h,
+        original_width: orig_w,
+        original_height: orig_h,
+    });
+
+    Ok(KenbanImageResult {
+        file_url: file_path_str,
+        width: new_w,
+        height: new_h,
+        original_width: orig_w,
+        original_height: orig_h,
+    })
+}
+
+// 複数画像を先読み（バックグラウンドでキャッシュ）- rayon並列化版
+#[tauri::command]
+pub async fn preload_images(
+    state: State<'_, KenbanState>,
+    paths: Vec<String>,
+    max_width: u32,
+    max_height: u32,
+) -> Result<Vec<String>, String> {
+    // 既にメモリキャッシュにあるパスを除外
+    let paths_to_load: Vec<String> = {
+        let cache = state.image_cache.lock().map_err(|e| e.to_string())?;
+        paths.into_iter()
+            .filter(|path| {
+                let cache_key = format!("{}:{}x{}", versioned_path_key(path), max_width, max_height);
+                cache.get(&cache_key).is_none()
+            })
+            .collect()
+    };
+
+    if paths_to_load.is_empty() {
+        return Ok(vec!["all cached".to_string()]);
+    }
+
+    // rayonで並列に画像を読み込み・リサイズ → tempファイルに書き出し
+    let loaded: Vec<(String, Result<(String, u32, u32, u32, u32), String>)> = paths_to_load
+        .par_iter()
+        .map(|path| {
+            let cache_key = format!("{}:{}x{}", versioned_path_key(path), max_width, max_height);
+
+            // ディスクキャッシュチェック
+            if let Ok(temp_dir) = get_kenban_temp_dir() {
+                let filename = cache_key_to_filename(&cache_key);
+                let file_path = temp_dir.join(&filename);
+                if file_path.exists() {
+                    if let Ok((w, h)) = image::image_dimensions(&file_path) {
+                        let (orig_w, orig_h) = image::image_dimensions(path.as_str()).unwrap_or((w, h));
+                        return (path.clone(), Ok((file_path.to_string_lossy().to_string(), w, h, orig_w, orig_h)));
+                    }
+                }
+            }
+
+            let result = image::open(path)
+                .map_err(|e| format!("open error: {}", e))
+                .and_then(|img| {
+                    let (orig_w, orig_h) = img.dimensions();
+                    let (file_path_str, new_w, new_h) = resize_and_write_to_temp(&img, max_width, max_height, &cache_key)?;
+                    Ok((file_path_str, new_w, new_h, orig_w, orig_h))
+                });
+            (path.clone(), result)
+        })
+        .collect();
+
+    // キャッシュに一括登録
+    let mut results = Vec::new();
+    {
+        let mut cache = state.image_cache.lock().map_err(|e| e.to_string())?;
+        for (path, result) in loaded {
+            let cache_key = format!("{}:{}x{}", versioned_path_key(&path), max_width, max_height);
+            match result {
+                Ok((file_path_str, new_w, new_h, orig_w, orig_h)) => {
+                    cache.insert(cache_key, CachedImage {
+                        file_path: file_path_str,
+                        width: new_w,
+                        height: new_h,
+                        original_width: orig_w,
+                        original_height: orig_h,
+                    });
+                    results.push(format!("loaded:{}", path));
+                }
+                Err(e) => results.push(format!("error:{}:{}", path, e)),
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+// キャッシュクリア
+#[tauri::command]
+pub fn clear_image_cache(state: State<'_, KenbanState>) -> Result<(), String> {
+    let mut cache = state.image_cache.lock().map_err(|e| e.to_string())?;
+    cache.clear();
+    Ok(())
+}
+
+// tempフォルダのプレビューファイルをクリーンアップ（1時間以上前のファイルを削除）
+#[tauri::command]
+pub fn kenban_cleanup_preview_cache() -> Result<u32, String> {
+    let temp_dir = get_kenban_temp_dir()?;
+    let now = std::time::SystemTime::now();
+    let one_hour = std::time::Duration::from_secs(3600);
+    let mut deleted = 0u32;
+
+    if let Ok(entries) = fs::read_dir(&temp_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            // jpg, png, tmp すべてを対象（diff画像のPNGや書き込み途中のtmpも含む）
+            if matches!(ext, "jpg" | "png" | "tmp") {
+                if let Ok(metadata) = path.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(age) = now.duration_since(modified) {
+                            if age > one_hour {
+                                let _ = fs::remove_file(&path);
+                                deleted += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(deleted)
+}
+
+// フォルダ内のファイル一覧を取得
+#[tauri::command]
+pub fn kenban_list_files_in_folder(path: String, extensions: Vec<String>) -> Result<Vec<String>, String> {
+    let dir = std::fs::read_dir(&path)
+        .map_err(|e| format!("Failed to read directory: {}", e))?;
+
+    let mut files: Vec<String> = dir
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.is_file() {
+                let ext = path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_lowercase())
+                    .unwrap_or_default();
+                if extensions.iter().any(|e| e.to_lowercase() == ext) {
+                    return path.to_str().map(|s| s.to_string());
+                }
+            }
+            None
+        })
+        .collect();
+
+    // 自然順ソート（ファイル名でソート）
+    files.sort_by(|a, b| {
+        let name_a = PathBuf::from(a).file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let name_b = PathBuf::from(b).file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        natord::compare(&name_a, &name_b)
+    });
+
+    Ok(files)
+}
+
+// ============== 差分計算 ==============
+
+#[derive(Deserialize)]
+pub struct KenbanCropBounds {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+}
+
+#[derive(Serialize, Clone)]
+pub struct DiffMarker {
+    x: f64,
+    y: f64,
+    radius: f64,
+    count: u32,
+}
+
+#[derive(Serialize)]
+pub struct DiffSimpleResult {
+    src_a: String,
+    src_b: String,
+    diff_src: String,
+    has_diff: bool,
+    diff_count: u32,
+    markers: Vec<DiffMarker>,
+    image_width: u32,
+    image_height: u32,
+}
+
+// Phase1用: 画像エンコードなしの軽量チェック結果
+#[derive(Serialize)]
+pub struct DiffCheckSimpleResult {
+    has_diff: bool,
+    diff_count: u32,
+    markers: Vec<DiffMarker>,
+    image_width: u32,
+    image_height: u32,
+}
+
+#[derive(Serialize)]
+pub struct DiffCheckHeatmapResult {
+    has_diff: bool,
+    diff_probability: f64,
+    high_density_count: u32,
+    markers: Vec<DiffMarker>,
+    image_width: u32,
+    image_height: u32,
+}
+
+#[derive(Serialize)]
+pub struct DiffHeatmapResult {
+    src_a: String,
+    src_b: String,
+    processed_a: String,
+    diff_src: String,
+    has_diff: bool,
+    diff_probability: f64,
+    high_density_count: u32,
+    markers: Vec<DiffMarker>,
+    image_width: u32,
+    image_height: u32,
+}
+
+// panicメッセージを文字列として抽出
+#[allow(dead_code)]
+pub fn extract_panic_message(panic_info: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic_info.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "Unknown error in PSD decoder".to_string()
+    }
+}
+
+// ============== フォールバックPSDパーサー ==============
+/// psd crate出力の簡易検証（大半が黒/透明でないか）
+pub fn is_image_valid(img: &DynamicImage) -> bool {
+    let rgba = img.to_rgba8();
+    let pixels = rgba.as_raw();
+    let total = (rgba.width() * rgba.height()) as usize;
+    if total == 0 { return false; }
+
+    let step = (total / 500).max(1);
+    let mut non_black: usize = 0;
+    for i in (0..total).step_by(step) {
+        let idx = i * 4;
+        if idx + 2 < pixels.len() && (pixels[idx] > 0 || pixels[idx + 1] > 0 || pixels[idx + 2] > 0) {
+            non_black += 1;
+        }
+    }
+    let sampled = (total / step).max(1);
+    non_black * 100 / sampled > 3 // 3%以上が非黒なら有効
+}
+
+/// PSD解析の堅牢ラッパー: フォールバックパーサーを優先し、失敗時のみpsd crateを使用
+pub fn decode_psd_robust(bytes: &[u8]) -> Result<DynamicImage, String> {
+    // 1. フォールバックパーサーを優先（Image Data Sectionを直接読む — 最も信頼性が高い）
+    if let Ok(img) = decode_psd_fallback(bytes) {
+        return Ok(img);
+    }
+
+    // 2. フォールバック失敗時はpsd crateを試行
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let psd = Psd::from_bytes(bytes).map_err(|e| format!("Failed to parse PSD: {}", e))?;
+        let width = psd.width();
+        let height = psd.height();
+        let rgba = psd.rgba();
+        let img_buf: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_raw(width, height, rgba)
+                .ok_or_else(|| "Failed to create image buffer".to_string())?;
+        Ok::<DynamicImage, String>(DynamicImage::ImageRgba8(img_buf))
+    }));
+
+    match result {
+        Ok(Ok(img)) if is_image_valid(&img) => Ok(img),
+        Ok(Ok(_)) => Err("PSD画像のデコード結果が不正です（画像データが破損している可能性があります）".to_string()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("PSD解析中にエラーが発生しました".to_string()),
+    }
+}
+
+/// PSDバイト列からRGBA DynamicImageをデコード（フォールバック用）
+pub fn decode_psd_fallback(bytes: &[u8]) -> Result<DynamicImage, String> {
+    if bytes.len() < 26 {
+        return Err("PSD file too small".to_string());
+    }
+    // シグネチャ検証
+    if &bytes[0..4] != b"8BPS" {
+        return Err("Not a PSD file".to_string());
+    }
+    let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+    let is_psb = version == 2;
+    if version != 1 && version != 2 {
+        return Err(format!("Unsupported PSD version: {}", version));
+    }
+
+    let mut offset: usize = 12;
+
+    // ファイルヘッダー
+    let channels = read_u16(bytes, &mut offset)? as usize;
+    let height = read_u32(bytes, &mut offset)? as usize;
+    let width = read_u32(bytes, &mut offset)? as usize;
+    let depth = read_u16(bytes, &mut offset)?;
+    let color_mode = read_u16(bytes, &mut offset)?;
+
+    if depth != 8 {
+        return Err(format!("フォールバックパーサーは{}bit深度に未対応です", depth));
+    }
+
+    // Color Mode Data セクションをスキップ
+    let color_data_len = read_u32(bytes, &mut offset)? as usize;
+    offset += color_data_len;
+
+    // Image Resources セクションをスキップ
+    let resource_len = read_u32(bytes, &mut offset)? as usize;
+    offset += resource_len;
+
+    // Layer and Mask Information セクションをスキップ
+    let layer_len = if is_psb {
+        read_u64(bytes, &mut offset)? as usize
+    } else {
+        read_u32(bytes, &mut offset)? as usize
+    };
+    offset += layer_len;
+
+    // Image Data Section
+    let compression = read_u16(bytes, &mut offset)?;
+    let ch_to_read = if color_mode == 4 {
+        channels.min(4) // CMYK: 4チャンネル
+    } else {
+        channels.min(3) // RGB等: 3チャンネル
+    };
+    let pixel_count = width * height;
+
+    let channel_data: Vec<Vec<u8>> = match compression {
+        0 => {
+            // 非圧縮 (Raw)
+            let mut chs = Vec::with_capacity(ch_to_read);
+            for c in 0..channels {
+                if c < ch_to_read {
+                    if offset + pixel_count > bytes.len() {
+                        return Err("PSD data truncated (raw channel)".to_string());
+                    }
+                    chs.push(bytes[offset..offset + pixel_count].to_vec());
+                }
+                offset += pixel_count;
+            }
+            chs
+        }
+        1 => {
+            // RLE圧縮
+            let total_rows = channels * height;
+            if offset + total_rows * 2 > bytes.len() {
+                return Err("PSD data truncated (RLE row counts)".to_string());
+            }
+            let mut row_counts = Vec::with_capacity(total_rows);
+            for _ in 0..total_rows {
+                row_counts.push(read_u16(bytes, &mut offset)? as usize);
+            }
+
+            let mut chs = Vec::with_capacity(ch_to_read);
+            let mut row_idx = 0;
+            for c in 0..channels {
+                if c < ch_to_read {
+                    let mut ch_data = vec![0u8; pixel_count];
+                    let mut pixel_off = 0;
+                    for _ in 0..height {
+                        let row_len = row_counts[row_idx];
+                        row_idx += 1;
+                        if offset + row_len > bytes.len() {
+                            return Err("PSD data truncated (RLE data)".to_string());
+                        }
+                        decode_packbits(bytes, offset, row_len, &mut ch_data, pixel_off, width);
+                        offset += row_len;
+                        pixel_off += width;
+                    }
+                    chs.push(ch_data);
+                } else {
+                    for _ in 0..height {
+                        offset += row_counts[row_idx];
+                        row_idx += 1;
+                    }
+                }
+            }
+            chs
+        }
+        _ => {
+            return Err(format!("未対応の圧縮方式です (compression={})", compression));
+        }
+    };
+
+    // RGBA画像を組み立て
+    let mut rgba = vec![0u8; pixel_count * 4];
+
+    if color_mode == 4 {
+        // CMYK → RGB変換
+        let c_ch = &channel_data[0];
+        let m_ch = &channel_data[1.min(channel_data.len() - 1)];
+        let y_ch = &channel_data[2.min(channel_data.len() - 1)];
+        let k_ch = if channel_data.len() >= 4 { &channel_data[3] } else { c_ch };
+        for i in 0..pixel_count {
+            let j = i * 4;
+            let (c, m, y, k) = (c_ch[i] as u16, m_ch[i] as u16, y_ch[i] as u16, k_ch[i] as u16);
+            rgba[j]     = 255 - ((c + k).min(255) as u8);
+            rgba[j + 1] = 255 - ((m + k).min(255) as u8);
+            rgba[j + 2] = 255 - ((y + k).min(255) as u8);
+            rgba[j + 3] = 255;
+        }
+    } else {
+        // RGB / Grayscale
+        let r = &channel_data[0];
+        let g = if channel_data.len() >= 2 { &channel_data[1] } else { r };
+        let b = if channel_data.len() >= 3 { &channel_data[2] } else { r };
+        for i in 0..pixel_count {
+            let j = i * 4;
+            rgba[j]     = r[i];
+            rgba[j + 1] = g[i];
+            rgba[j + 2] = b[i];
+            rgba[j + 3] = 255;
+        }
+    }
+
+    let img_buf: ImageBuffer<Rgba<u8>, Vec<u8>> =
+        ImageBuffer::from_raw(width as u32, height as u32, rgba)
+            .ok_or_else(|| "Failed to create image buffer (fallback)".to_string())?;
+    Ok(DynamicImage::ImageRgba8(img_buf))
+}
+
+// PackBits (RLE) デコード
+pub fn decode_packbits(src: &[u8], src_start: usize, src_len: usize, dst: &mut [u8], dst_start: usize, dst_len: usize) {
+    let mut s = src_start;
+    let mut d = dst_start;
+    let src_end = src_start + src_len;
+    let dst_end = dst_start + dst_len;
+    while d < dst_end && s < src_end {
+        let n = src[s] as i8;
+        s += 1;
+        if n >= 0 {
+            // リテラルコピー: n+1 バイト
+            let count = (n as usize) + 1;
+            let end = (d + count).min(dst_end);
+            while d < end && s < src_end {
+                dst[d] = src[s];
+                d += 1;
+                s += 1;
+            }
+        } else if n > -128 {
+            // 繰り返し: 1-n 回
+            let count = (1 - n as i16) as usize;
+            if s >= src_end { break; }
+            let val = src[s];
+            s += 1;
+            let end = (d + count).min(dst_end);
+            while d < end {
+                dst[d] = val;
+                d += 1;
+            }
+        }
+        // n == -128 はNOP
+    }
+}
+
+// バイト読み取りヘルパー
+pub fn read_u16(bytes: &[u8], offset: &mut usize) -> Result<u16, String> {
+    if *offset + 2 > bytes.len() {
+        return Err("PSD data truncated (u16)".to_string());
+    }
+    let val = u16::from_be_bytes([bytes[*offset], bytes[*offset + 1]]);
+    *offset += 2;
+    Ok(val)
+}
+
+pub fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, String> {
+    if *offset + 4 > bytes.len() {
+        return Err("PSD data truncated (u32)".to_string());
+    }
+    let val = u32::from_be_bytes([bytes[*offset], bytes[*offset + 1], bytes[*offset + 2], bytes[*offset + 3]]);
+    *offset += 4;
+    Ok(val)
+}
+
+pub fn read_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, String> {
+    if *offset + 8 > bytes.len() {
+        return Err("PSD data truncated (u64)".to_string());
+    }
+    let val = u64::from_be_bytes([
+        bytes[*offset], bytes[*offset + 1], bytes[*offset + 2], bytes[*offset + 3],
+        bytes[*offset + 4], bytes[*offset + 5], bytes[*offset + 6], bytes[*offset + 7],
+    ]);
+    *offset += 8;
+    Ok(val)
+}
+
+// 拡張子でPSD/TIFF/その他を自動判定してデコード
+pub fn decode_image_file(path: &str) -> Result<DynamicImage, String> {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".psd") {
+        decode_psd_to_image(path)
+    } else {
+        image::open(path).map_err(|e| format!("Failed to open image {}: {}", path, e))
+    }
+}
+
+// PSDファイルをDynamicImageとしてデコード
+pub fn decode_psd_to_image(path: &str) -> Result<DynamicImage, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read PSD: {}", e))?;
+    decode_psd_robust(&bytes)
+}
+
+// DynamicImageをJPEG 85%でtempファイルに書き出し、パスを返す
+pub fn encode_to_jpeg_temp(img: &DynamicImage, cache_key: &str) -> Result<String, String> {
+    let temp_dir = get_kenban_temp_dir()?;
+    let filename = {
+        let mut hasher = DefaultHasher::new();
+        cache_key.hash(&mut hasher);
+        format!("kenban_diff_{:016x}.jpg", hasher.finish())
+    };
+    let file_path = temp_dir.join(&filename);
+
+    if file_path.exists() {
+        return Ok(file_path.to_string_lossy().to_string());
+    }
+
+    let rgb = img.to_rgb8();
+    let tmp_path = temp_dir.join(format!("{}.tmp", filename));
+    let file = fs::File::create(&tmp_path)
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+        std::io::BufWriter::new(file), 85
+    );
+    rgb.write_with_encoder(encoder)
+        .map_err(|e| format!("JPEG encode error: {}", e))?;
+    fs::rename(&tmp_path, &file_path)
+        .map_err(|e| format!("Failed to rename temp file: {}", e))?;
+
+    Ok(file_path.to_string_lossy().to_string())
+}
+
+// RGBAバッファをPNGでtempファイルに書き出し、パスを返す（差分画像用）
+pub fn encode_rgba_to_png_temp(buf: &[u8], width: u32, height: u32, cache_key: &str) -> Result<String, String> {
+    let temp_dir = get_kenban_temp_dir()?;
+    let filename = {
+        let mut hasher = DefaultHasher::new();
+        cache_key.hash(&mut hasher);
+        format!("kenban_diff_{:016x}.png", hasher.finish())
+    };
+    let file_path = temp_dir.join(&filename);
+
+    if file_path.exists() {
+        return Ok(file_path.to_string_lossy().to_string());
+    }
+
+    let img: ImageBuffer<Rgba<u8>, &[u8]> =
+        ImageBuffer::from_raw(width, height, buf)
+            .ok_or_else(|| "Failed to create image buffer".to_string())?;
+    let tmp_path = temp_dir.join(format!("{}.tmp", filename));
+    let file = fs::File::create(&tmp_path)
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    img.write_to(&mut std::io::BufWriter::new(file), image::ImageFormat::Png)
+        .map_err(|e| format!("PNG encode error: {}", e))?;
+    fs::rename(&tmp_path, &file_path)
+        .map_err(|e| format!("Failed to rename temp file: {}", e))?;
+
+    Ok(file_path.to_string_lossy().to_string())
+}
+
+pub struct DiffPixel {
+    x: u32,
+    y: u32,
+}
+
+// ピクセル単位の単純差分計算 (rayon行並列)
+pub fn diff_simple_core(
+    a: &[u8], b: &[u8], width: u32, height: u32, threshold: u8,
+) -> (Vec<u8>, u32, Vec<DiffPixel>) {
+    let threshold = threshold as i16;
+    let row_size = (width as usize) * 4;
+
+    // 行ごとに並列処理
+    let rows: Vec<(Vec<u8>, u32, Vec<DiffPixel>)> = (0..height)
+        .into_par_iter()
+        .map(|y| {
+            let offset = (y as usize) * row_size;
+            let row_a = &a[offset..offset + row_size];
+            let row_b = &b[offset..offset + row_size];
+            let mut row_buf = vec![0u8; row_size];
+            let mut count = 0u32;
+            let mut pixels = Vec::new();
+
+            for x in 0..width as usize {
+                let i = x * 4;
+                let dr = (row_a[i] as i16 - row_b[i] as i16).abs();
+                let dg = (row_a[i + 1] as i16 - row_b[i + 1] as i16).abs();
+                let db = (row_a[i + 2] as i16 - row_b[i + 2] as i16).abs();
+
+                if dr > threshold || dg > threshold || db > threshold {
+                    row_buf[i] = 255;     // R
+                    row_buf[i + 1] = 0;   // G
+                    row_buf[i + 2] = 0;   // B
+                    row_buf[i + 3] = 255; // A
+                    count += 1;
+                    pixels.push(DiffPixel { x: x as u32, y });
+                } else {
+                    // 黒背景（alpha=255）
+                    row_buf[i + 3] = 255;
+                }
+            }
+            (row_buf, count, pixels)
+        })
+        .collect();
+
+    let total_size = (width as usize) * (height as usize) * 4;
+    let mut diff_buf = vec![0u8; total_size];
+    let mut total_count = 0u32;
+    let mut all_pixels = Vec::new();
+
+    for (y, (row_buf, count, pixels)) in rows.into_iter().enumerate() {
+        let offset = y * row_size;
+        diff_buf[offset..offset + row_size].copy_from_slice(&row_buf);
+        total_count += count;
+        all_pixels.extend(pixels);
+    }
+
+    (diff_buf, total_count, all_pixels)
+}
+
+// ヒートマップ差分計算（積分画像→密度マップ→着色）
+pub fn diff_heatmap_core(
+    a: &[u8], b: &[u8], width: u32, height: u32, threshold: u8,
+) -> (Vec<u8>, u32, Vec<DiffPixel>) {
+    let w = width as usize;
+    let h = height as usize;
+    let threshold = threshold as i16;
+
+    // Phase 1: diffMask作成（rayon並列）
+    let diff_mask: Vec<u8> = (0..h)
+        .into_par_iter()
+        .flat_map(|y| {
+            let offset = y * w * 4;
+            (0..w).map(move |x| {
+                let i = offset + x * 4;
+                let dr = (a[i] as i16 - b[i] as i16).abs();
+                let dg = (a[i + 1] as i16 - b[i + 1] as i16).abs();
+                let db = (a[i + 2] as i16 - b[i + 2] as i16).abs();
+                if dr > threshold || dg > threshold || db > threshold { 1u8 } else { 0u8 }
+            }).collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Phase 2: 積分画像（sequential - データ依存あり）
+    let iw = w + 1;
+    let ih = h + 1;
+    let mut integral = vec![0f32; iw * ih];
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y + 1) * iw + (x + 1);
+            integral[idx] = diff_mask[y * w + x] as f32
+                + integral[idx - 1]
+                + integral[idx - iw]
+                - integral[idx - iw - 1];
+        }
+    }
+
+    // Phase 3: 密度マップ（rayon並列 - integralは読み取り専用）
+    let radius: i32 = 15;
+    let density_and_max: Vec<(f32, f32)> = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            let mut row_max = 0f32;
+            let row: Vec<f32> = (0..w).map(|x| {
+                let x1 = (x as i32 - radius).max(0) as usize;
+                let y1 = (y as i32 - radius).max(0) as usize;
+                let x2 = ((x as i32 + radius) as usize).min(w - 1);
+                let y2 = ((y as i32 + radius) as usize).min(h - 1);
+                let area = ((x2 - x1 + 1) * (y2 - y1 + 1)) as f32;
+                let sum = integral[(y2 + 1) * iw + (x2 + 1)]
+                    - integral[y1 * iw + (x2 + 1)]
+                    - integral[(y2 + 1) * iw + x1]
+                    + integral[y1 * iw + x1];
+                let d = sum / area;
+                if d > row_max { row_max = d; }
+                d
+            }).collect();
+            row.into_iter().map(move |d| (d, row_max)).collect::<Vec<_>>()
+        })
+        .flatten()
+        .collect();
+
+    // maxDensityを求める
+    let max_density = density_and_max.iter().map(|(_, m)| *m).fold(0f32, f32::max);
+
+    // Phase 4: ヒートマップ着色 + 高密度ピクセル収集（rayon並列）
+    let density_threshold = 0.05f32;
+    let rows: Vec<(Vec<u8>, u32, Vec<DiffPixel>)> = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            let row_size = w * 4;
+            let mut row_buf = vec![0u8; row_size];
+            let mut high_count = 0u32;
+            let mut high_pixels = Vec::new();
+
+            for x in 0..w {
+                let pixel_idx = y * w + x;
+                let di = x * 4;
+                let (density, _) = density_and_max[pixel_idx];
+                let normalized = if max_density > 0.0 { density / max_density } else { 0.0 };
+
+                if diff_mask[pixel_idx] == 1 && density > density_threshold {
+                    let (r, g, b) = if normalized < 0.3 {
+                        (0u8, (normalized / 0.3 * 200.0) as u8, 200u8)
+                    } else if normalized < 0.6 {
+                        let t = (normalized - 0.3) / 0.3;
+                        ((t * 255.0) as u8, (200.0 + t * 55.0) as u8, ((1.0 - t) * 200.0) as u8)
+                    } else {
+                        let t = (normalized - 0.6) / 0.4;
+                        high_count += 1;
+                        high_pixels.push(DiffPixel { x: x as u32, y: y as u32 });
+                        (255u8, ((1.0 - t) * 255.0) as u8, 0u8)
+                    };
+                    row_buf[di] = r;
+                    row_buf[di + 1] = g;
+                    row_buf[di + 2] = b;
+                    row_buf[di + 3] = 255;
+                } else {
+                    // 黒背景
+                    row_buf[di + 3] = 255;
+                }
+            }
+            (row_buf, high_count, high_pixels)
+        })
+        .collect();
+
+    let total_size = w * h * 4;
+    let mut heatmap_buf = vec![0u8; total_size];
+    let mut total_high = 0u32;
+    let mut all_high_pixels = Vec::new();
+
+    for (y, (row_buf, count, pixels)) in rows.into_iter().enumerate() {
+        let offset = y * w * 4;
+        heatmap_buf[offset..offset + w * 4].copy_from_slice(&row_buf);
+        total_high += count;
+        all_high_pixels.extend(pixels);
+    }
+
+    (heatmap_buf, total_high, all_high_pixels)
+}
+
+// Union-Findクラスタリング → DiffMarkerリスト
+pub fn cluster_markers(
+    pixels: &[DiffPixel], grid_size: u32, min_cluster: u32, min_radius: f64,
+) -> Vec<DiffMarker> {
+    if pixels.is_empty() {
+        return Vec::new();
+    }
+
+    // グリッドにピクセルを分配
+    struct GridCell {
+        gx: i32,
+        gy: i32,
+        count: u32,
+        min_x: u32,
+        max_x: u32,
+        min_y: u32,
+        max_y: u32,
+    }
+
+    let mut grid: HashMap<(i32, i32), GridCell> = HashMap::new();
+    for p in pixels {
+        let gx = (p.x / grid_size) as i32;
+        let gy = (p.y / grid_size) as i32;
+        let cell = grid.entry((gx, gy)).or_insert(GridCell {
+            gx, gy, count: 0, min_x: p.x, max_x: p.x, min_y: p.y, max_y: p.y,
+        });
+        cell.count += 1;
+        cell.min_x = cell.min_x.min(p.x);
+        cell.max_x = cell.max_x.max(p.x);
+        cell.min_y = cell.min_y.min(p.y);
+        cell.max_y = cell.max_y.max(p.y);
+    }
+
+    let cells: Vec<GridCell> = grid.into_values().collect();
+    if cells.is_empty() {
+        return Vec::new();
+    }
+
+    // Union-Find
+    let mut parent: Vec<usize> = (0..cells.len()).collect();
+    let find = |parent: &mut Vec<usize>, mut i: usize| -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    };
+
+    for i in 0..cells.len() {
+        for j in (i + 1)..cells.len() {
+            let dx = (cells[i].gx - cells[j].gx).abs();
+            let dy = (cells[i].gy - cells[j].gy).abs();
+            if dx <= 1 && dy <= 1 {
+                let pi = find(&mut parent, i);
+                let pj = find(&mut parent, j);
+                if pi != pj {
+                    parent[pi] = pj;
+                }
+            }
+        }
+    }
+
+    // グループ集約
+    let mut groups: HashMap<usize, (u32, u32, u32, u32, u32)> = HashMap::new();
+    for (i, cell) in cells.iter().enumerate() {
+        let root = find(&mut parent, i);
+        let g = groups.entry(root).or_insert((u32::MAX, 0, u32::MAX, 0, 0));
+        g.0 = g.0.min(cell.min_x);
+        g.1 = g.1.max(cell.max_x);
+        g.2 = g.2.min(cell.min_y);
+        g.3 = g.3.max(cell.max_y);
+        g.4 += cell.count;
+    }
+
+    let mut markers: Vec<DiffMarker> = groups.values()
+        .filter(|g| g.4 >= min_cluster)
+        .map(|g| {
+            let cx = (g.0 as f64 + g.1 as f64) / 2.0;
+            let cy = (g.2 as f64 + g.3 as f64) / 2.0;
+            let radius_x = (g.1 as f64 - g.0 as f64) / 2.0 + if min_radius > 200.0 { 100.0 } else { 60.0 };
+            let radius_y = (g.3 as f64 - g.2 as f64) / 2.0 + if min_radius > 200.0 { 100.0 } else { 60.0 };
+            let marker_radius = min_radius.max(radius_x.max(radius_y));
+            DiffMarker { x: cx, y: cy, radius: marker_radius, count: g.4 }
+        })
+        .collect();
+
+    markers.sort_by(|a, b| b.count.cmp(&a.count));
+    markers
+}
+
+// tiff-tiff / psd-psd 用の差分計算
+#[tauri::command]
+pub fn compute_diff_simple(
+    path_a: String, path_b: String, threshold: u8,
+) -> Result<DiffSimpleResult, String> {
+    // 2ファイル並列デコード
+    let (img_a, img_b) = rayon::join(
+        || decode_image_file(&path_a),
+        || decode_image_file(&path_b),
+    );
+    let img_a = img_a?;
+    let img_b = img_b?;
+
+    let (wa, ha) = img_a.dimensions();
+    let (wb, hb) = img_b.dimensions();
+    let width = wa.max(wb);
+    let height = ha.max(hb);
+
+    // 必要ならリサイズ
+    let img_a = if wa != width || ha != height {
+        img_a.resize_exact(width, height, FilterType::Triangle)
+    } else {
+        img_a
+    };
+    let img_b = if wb != width || hb != height {
+        img_b.resize_exact(width, height, FilterType::Triangle)
+    } else {
+        img_b
+    };
+
+    let rgba_a = img_a.to_rgba8();
+    let rgba_b = img_b.to_rgba8();
+
+    // 差分計算
+    let (diff_buf, diff_count, diff_pixels) =
+        diff_simple_core(rgba_a.as_raw(), rgba_b.as_raw(), width, height, threshold);
+
+    // マーカークラスタリング
+    let markers = cluster_markers(&diff_pixels, 200, 1, 300.0);
+
+    // 3画像を並列エンコード → JPEG tempファイル（A/B）+ PNG tempファイル（diff）
+    let cache_a = format!("simple_a_{}", versioned_path_key(&path_a));
+    let cache_b = format!("simple_b_{}", versioned_path_key(&path_b));
+    let cache_d = format!(
+        "simple_d_{}_{}",
+        versioned_path_key(&path_a),
+        versioned_path_key(&path_b)
+    );
+    let (src_a_result, (src_b_result, diff_result)) = rayon::join(
+        || encode_to_jpeg_temp(&img_a, &cache_a),
+        || rayon::join(
+            || encode_to_jpeg_temp(&img_b, &cache_b),
+            || encode_rgba_to_png_temp(&diff_buf, width, height, &cache_d),
+        ),
+    );
+
+    Ok(DiffSimpleResult {
+        src_a: src_a_result?,
+        src_b: src_b_result?,
+        diff_src: diff_result?,
+        has_diff: diff_count > 0,
+        diff_count,
+        markers,
+        image_width: width,
+        image_height: height,
+    })
+}
+
+// psd-tiff 用のヒートマップ差分計算
+#[tauri::command]
+pub fn compute_diff_heatmap(
+    psd_path: String, tiff_path: String, crop_bounds: KenbanCropBounds, threshold: u8,
+) -> Result<DiffHeatmapResult, String> {
+    // 並列デコード
+    let (psd_result, tiff_result) = rayon::join(
+        || decode_psd_to_image(&psd_path),
+        || image::open(&tiff_path).map_err(|e| format!("Failed to open TIFF: {}", e)),
+    );
+    let psd_img = psd_result?;
+    let tiff_img = tiff_result?;
+
+    let (tiff_w, tiff_h) = tiff_img.dimensions();
+
+    // PSDをクロップ
+    let crop_w = crop_bounds.right - crop_bounds.left;
+    let crop_h = crop_bounds.bottom - crop_bounds.top;
+    let cropped = psd_img.crop_imm(crop_bounds.left, crop_bounds.top, crop_w, crop_h);
+
+    // TIFFサイズにリサイズ（CatmullRom = Photoshop ResampleMethod.AUTOMATIC 相当）
+    let processed_psd = cropped.resize_exact(tiff_w, tiff_h, FilterType::CatmullRom);
+
+    let rgba_a = processed_psd.to_rgba8();
+    let rgba_b = tiff_img.to_rgba8();
+
+    // ヒートマップ差分計算
+    let (heatmap_buf, high_density_count, high_pixels) =
+        diff_heatmap_core(rgba_a.as_raw(), rgba_b.as_raw(), tiff_w, tiff_h, threshold);
+
+    // マーカークラスタリング (gridSize=250, minCluster=20, minRadius=80)
+    let markers = cluster_markers(&high_pixels, 250, 20, 80.0);
+
+    // diffProbability計算
+    let diff_probability = if high_density_count > 0 {
+        let total_pixels = (tiff_w as f64) * (tiff_h as f64);
+        let base_prob = 70.0;
+        let additional = (high_density_count as f64 / total_pixels * 50000.0).min(30.0);
+        ((base_prob + additional) * 10.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    // 4画像を並列エンコード → JPEG tempファイル（A/B/processedA）+ PNG tempファイル（diff）
+    let cache_a = format!("heatmap_a_{}", versioned_path_key(&psd_path));
+    let cache_b = format!("heatmap_b_{}", versioned_path_key(&tiff_path));
+    let cache_pa = format!(
+        "heatmap_pa_{}_{}",
+        versioned_path_key(&psd_path),
+        versioned_path_key(&tiff_path)
+    );
+    let cache_d = format!(
+        "heatmap_d_{}_{}",
+        versioned_path_key(&psd_path),
+        versioned_path_key(&tiff_path)
+    );
+    let ((src_a_result, src_b_result), (processed_a_result, diff_result)) = rayon::join(
+        || rayon::join(
+            || encode_to_jpeg_temp(&psd_img, &cache_a),
+            || encode_to_jpeg_temp(&tiff_img, &cache_b),
+        ),
+        || rayon::join(
+            || encode_to_jpeg_temp(&processed_psd, &cache_pa),
+            || encode_rgba_to_png_temp(&heatmap_buf, tiff_w, tiff_h, &cache_d),
+        ),
+    );
+
+    Ok(DiffHeatmapResult {
+        src_a: src_a_result?,
+        src_b: src_b_result?,
+        processed_a: processed_a_result?,
+        diff_src: diff_result?,
+        has_diff: high_density_count > 0,
+        diff_probability,
+        high_density_count,
+        markers,
+        image_width: tiff_w,
+        image_height: tiff_h,
+    })
+}
+
+// Phase1用: 軽量差分チェック（画像エンコードなし）
+#[tauri::command]
+pub fn check_diff_simple(
+    path_a: String, path_b: String, threshold: u8,
+) -> Result<DiffCheckSimpleResult, String> {
+    // 2ファイル並列デコード
+    let (img_a, img_b) = rayon::join(
+        || decode_image_file(&path_a),
+        || decode_image_file(&path_b),
+    );
+    let img_a = img_a?;
+    let img_b = img_b?;
+
+    let (wa, ha) = img_a.dimensions();
+    let (wb, hb) = img_b.dimensions();
+    let width = wa.max(wb);
+    let height = ha.max(hb);
+
+    // 必要ならリサイズ
+    let img_a = if wa != width || ha != height {
+        img_a.resize_exact(width, height, FilterType::Triangle)
+    } else {
+        img_a
+    };
+    let img_b = if wb != width || hb != height {
+        img_b.resize_exact(width, height, FilterType::Triangle)
+    } else {
+        img_b
+    };
+
+    let rgba_a = img_a.to_rgba8();
+    let rgba_b = img_b.to_rgba8();
+
+    // 差分計算
+    let (_diff_buf, diff_count, diff_pixels) =
+        diff_simple_core(rgba_a.as_raw(), rgba_b.as_raw(), width, height, threshold);
+
+    // マーカークラスタリング
+    let markers = cluster_markers(&diff_pixels, 200, 1, 300.0);
+
+    // 画像エンコードをスキップ！
+    Ok(DiffCheckSimpleResult {
+        has_diff: diff_count > 0,
+        diff_count,
+        markers,
+        image_width: width,
+        image_height: height,
+    })
+}
+
+// Phase1用: 軽量ヒートマップ差分チェック（画像エンコードなし）
+#[tauri::command]
+pub fn check_diff_heatmap(
+    psd_path: String, tiff_path: String, crop_bounds: KenbanCropBounds, threshold: u8,
+) -> Result<DiffCheckHeatmapResult, String> {
+    // 並列デコード
+    let (psd_result, tiff_result) = rayon::join(
+        || decode_psd_to_image(&psd_path),
+        || image::open(&tiff_path).map_err(|e| format!("Failed to open TIFF: {}", e)),
+    );
+    let psd_img = psd_result?;
+    let tiff_img = tiff_result?;
+
+    let (tiff_w, tiff_h) = tiff_img.dimensions();
+
+    // PSDをクロップ
+    let crop_w = crop_bounds.right - crop_bounds.left;
+    let crop_h = crop_bounds.bottom - crop_bounds.top;
+    let cropped = psd_img.crop_imm(crop_bounds.left, crop_bounds.top, crop_w, crop_h);
+
+    // TIFFサイズにリサイズ（CatmullRom = Photoshop ResampleMethod.AUTOMATIC 相当）
+    let processed_psd = cropped.resize_exact(tiff_w, tiff_h, FilterType::CatmullRom);
+
+    let rgba_a = processed_psd.to_rgba8();
+    let rgba_b = tiff_img.to_rgba8();
+
+    // ヒートマップ差分計算
+    let (_heatmap_buf, high_density_count, high_pixels) =
+        diff_heatmap_core(rgba_a.as_raw(), rgba_b.as_raw(), tiff_w, tiff_h, threshold);
+
+    // マーカークラスタリング
+    let markers = cluster_markers(&high_pixels, 250, 20, 80.0);
+
+    // diffProbability計算
+    let diff_probability = if high_density_count > 0 {
+        let total_pixels = (tiff_w as f64) * (tiff_h as f64);
+        let base_prob = 70.0;
+        let additional = (high_density_count as f64 / total_pixels * 50000.0).min(30.0);
+        ((base_prob + additional) * 10.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    // 画像エンコードをスキップ！
+    Ok(DiffCheckHeatmapResult {
+        has_diff: high_density_count > 0,
+        diff_probability,
+        high_density_count,
+        markers,
+        image_width: tiff_w,
+        image_height: tiff_h,
+    })
+}
+
+// ============== PDF差分計算 (PDFium) ==============
+
+/// PDFiumライブラリのバインディングを取得
+pub fn get_pdfium() -> Result<Pdfium, String> {
+    // 実行ファイルと同じディレクトリからpdfium.dllを探す
+    let exe_dir = std::env::current_exe()
+        .map_err(|e| format!("Failed to get exe path: {}", e))?
+        .parent()
+        .ok_or_else(|| "Failed to get exe directory".to_string())?
+        .to_path_buf();
+
+    let bindings = Pdfium::bind_to_library(
+        Pdfium::pdfium_platform_library_name_at_path(&exe_dir)
+    ).or_else(|_| Pdfium::bind_to_system_library())
+        .map_err(|e| format!("Failed to load PDFium library: {}. Place pdfium.dll next to the executable.", e))?;
+
+    Ok(Pdfium::new(bindings))
+}
+
+/// PDFiumで指定ページをRGBA画像にレンダリング
+pub fn render_pdf_page_pdfium(pdfium: &Pdfium, path: &str, page: u32, dpi: f32) -> Result<(Vec<u8>, u32, u32), String> {
+    let doc = pdfium.load_pdf_from_file(path, None)
+        .map_err(|e| format!("Failed to open PDF '{}': {}", path, e))?;
+
+    let page_count = doc.pages().len() as u32;
+    if page >= page_count {
+        return Err(format!("Page {} out of range (total: {})", page, page_count));
+    }
+
+    let pg = doc.pages().get(page as u16)
+        .map_err(|e| format!("Failed to load page {}: {}", page, e))?;
+
+    let scale = dpi / 72.0;
+    let config = PdfRenderConfig::new()
+        .scale_page_by_factor(scale)
+        .use_print_quality(true);
+
+    let bitmap = pg.render_with_config(&config)
+        .map_err(|e| format!("Failed to render page {}: {}", page, e))?;
+
+    let width = bitmap.width() as u32;
+    let height = bitmap.height() as u32;
+    let rgba = bitmap.as_rgba_bytes();
+
+    Ok((rgba, width, height))
+}
+
+// PDF-PDF差分計算（PDFiumレンダリング + rayon並列差分）
+#[tauri::command]
+pub fn compute_pdf_diff(
+    path_a: String, path_b: String, page: u32, dpi: f32, threshold: u8,
+) -> Result<DiffSimpleResult, String> {
+    let pdfium = get_pdfium()?;
+
+    let (samples_a, wa, ha) = render_pdf_page_pdfium(&pdfium, &path_a, page, dpi)?;
+    let (samples_b, wb, hb) = render_pdf_page_pdfium(&pdfium, &path_b, page, dpi)?;
+
+    let width = wa.max(wb);
+    let height = ha.max(hb);
+
+    // サイズが異なる場合はDynamicImageでリサイズ
+    let rgba_a = if wa != width || ha != height {
+        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_raw(wa, ha, samples_a)
+                .ok_or_else(|| "Failed to create image buffer A".to_string())?;
+        let dyn_img = DynamicImage::ImageRgba8(img);
+        dyn_img.resize_exact(width, height, FilterType::Triangle).to_rgba8()
+    } else {
+        ImageBuffer::from_raw(wa, ha, samples_a)
+            .ok_or_else(|| "Failed to create image buffer A".to_string())?
+    };
+
+    let rgba_b = if wb != width || hb != height {
+        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_raw(wb, hb, samples_b)
+                .ok_or_else(|| "Failed to create image buffer B".to_string())?;
+        let dyn_img = DynamicImage::ImageRgba8(img);
+        dyn_img.resize_exact(width, height, FilterType::Triangle).to_rgba8()
+    } else {
+        ImageBuffer::from_raw(wb, hb, samples_b)
+            .ok_or_else(|| "Failed to create image buffer B".to_string())?
+    };
+
+    // rayon並列差分計算
+    let (diff_buf, diff_count, diff_pixels) =
+        diff_simple_core(rgba_a.as_raw(), rgba_b.as_raw(), width, height, threshold);
+
+    // マーカークラスタリング
+    let markers = cluster_markers(&diff_pixels, 200, 1, 300.0);
+
+    // 3画像を並列エンコード → JPEG tempファイル（A/B）+ PNG tempファイル（diff）
+    let img_a = DynamicImage::ImageRgba8(rgba_a);
+    let img_b = DynamicImage::ImageRgba8(rgba_b);
+    let cache_a = format!("pdf_a_{}_p{}", versioned_path_key(&path_a), page);
+    let cache_b = format!("pdf_b_{}_p{}", versioned_path_key(&path_b), page);
+    let cache_d = format!(
+        "pdf_d_{}_{}_p{}",
+        versioned_path_key(&path_a),
+        versioned_path_key(&path_b),
+        page
+    );
+    let (src_a_result, (src_b_result, diff_result)) = rayon::join(
+        || encode_to_jpeg_temp(&img_a, &cache_a),
+        || rayon::join(
+            || encode_to_jpeg_temp(&img_b, &cache_b),
+            || encode_rgba_to_png_temp(&diff_buf, width, height, &cache_d),
+        ),
+    );
+
+    Ok(DiffSimpleResult {
+        src_a: src_a_result?,
+        src_b: src_b_result?,
+        diff_src: diff_result?,
+        has_diff: diff_count > 0,
+        diff_count,
+        markers,
+        image_width: width,
+        image_height: height,
+    })
+}
+
+// PDFの指定ページを画像としてレンダリング（並列ビュー用）
+#[derive(Serialize)]
+pub struct KenbanPdfPageImage {
+    src: String,
+    width: u32,
+    height: u32,
+}
+
+#[tauri::command]
+pub fn kenban_render_pdf_page(
+    path: String, page: u32, dpi: f32, split_side: Option<String>,
+) -> Result<KenbanPdfPageImage, String> {
+    let pdfium = get_pdfium()?;
+    let (samples, width, height) = render_pdf_page_pdfium(&pdfium, &path, page, dpi)?;
+
+    // 見開き分割: 左右半分を切り出し
+    if let Some(ref side) = split_side {
+        let half_width = width / 2;
+        let offset_x = if side == "right" { half_width } else { 0 };
+        let mut split_buf = vec![0u8; (half_width as usize) * (height as usize) * 4];
+        for y in 0..height as usize {
+            let src_offset = (y * width as usize + offset_x as usize) * 4;
+            let dst_offset = y * half_width as usize * 4;
+            split_buf[dst_offset..dst_offset + half_width as usize * 4]
+                .copy_from_slice(&samples[src_offset..src_offset + half_width as usize * 4]);
+        }
+        let split_img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_raw(half_width, height, split_buf)
+                .ok_or_else(|| "Failed to create split image buffer".to_string())?;
+        let cache_key = format!("pdfpage_{}_p{}_{}", versioned_path_key(&path), page, side);
+        let src = encode_to_jpeg_temp(&DynamicImage::ImageRgba8(split_img), &cache_key)?;
+        return Ok(KenbanPdfPageImage { src, width: half_width, height });
+    }
+
+    let full_img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+        ImageBuffer::from_raw(width, height, samples)
+            .ok_or_else(|| "Failed to create image buffer".to_string())?;
+    let cache_key = format!("pdfpage_{}_p{}", versioned_path_key(&path), page);
+    let src = encode_to_jpeg_temp(&DynamicImage::ImageRgba8(full_img), &cache_key)?;
+    Ok(KenbanPdfPageImage { src, width, height })
+}
+
+// PDFの総ページ数を取得
+#[tauri::command]
+pub fn kenban_get_pdf_page_count(path: String) -> Result<u32, String> {
+    let pdfium = get_pdfium()?;
+    let doc = pdfium.load_pdf_from_file(&path, None)
+        .map_err(|e| format!("Failed to open PDF '{}': {}", path, e))?;
+    Ok(doc.pages().len() as u32)
+}
+
+#[tauri::command]
+pub fn get_cli_args(state: State<'_, KenbanState>) -> Vec<String> {
+    state.cli_args.clone()
+}
+
+// read_text_file and write_text_file are already in COMIC-Bridge commands.rs, so not duplicated here.

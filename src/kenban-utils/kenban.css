@@ -1,0 +1,84 @@
+/* ============================================
+   KENBAN Refined Design System v2
+   Cool Dark x Tint+Wash Accents x "Quiet Authority"
+
+   Scoped under .kenban-scope for COMIC-Bridge integration.
+   Tailwind v4 @theme directives converted to CSS custom properties.
+   ============================================ */
+
+.kenban-scope {
+  /* --- Font --- */
+  --font-sans: "Inter", "Noto Sans JP", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", monospace;
+
+  /* --- Surface (Cool Dark Neutrals) --- */
+  --color-surface-base: #0e0e10;
+  --color-surface-raised: #16161a;
+  --color-surface-overlay: #1c1c22;
+  --color-surface-elevated: #24242c;
+  --color-surface-interactive: #2c2c36;
+  --color-surface-hover: #353540;
+  --color-surface-active: #3e3e4a;
+
+  /* --- Text --- */
+  --color-text-primary: #ececf0;
+  --color-text-secondary: #9898a4;
+  --color-text-tertiary: #5c5c6a;
+  --color-text-disabled: #3e3e4a;
+
+  /* --- Action (Global interactive accent) --- */
+  --color-action: #6b8aff;
+  --color-action-hover: #8aa0ff;
+  --color-action-active: #5674e6;
+
+  /* --- Success / Error --- */
+  --color-success: #7cb88c;
+  --color-error: #c47c7c;
+
+  /* --- Base styles for kenban scope --- */
+  background-color: #0e0e10;
+  color: #ececf0;
+  letter-spacing: 0.01em;
+  font-family: "Inter", "Noto Sans JP", system-ui, sans-serif;
+}
+
+/* --- Custom Scrollbar (scoped) --- */
+.kenban-scope ::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.kenban-scope ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.kenban-scope ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+}
+
+.kenban-scope ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+/* --- Text Verify Light Panel — "Editorial Proofing" --- */
+.kenban-scope .tv-panel {
+  --tv-paper: #f7f5f0;
+  --tv-paper-warm: #f2efe8;
+  --tv-header: #edeae3;
+  --tv-rule: rgba(0, 0, 0, 0.08);
+  --tv-rule-strong: rgba(0, 0, 0, 0.14);
+  --tv-ink: #1e1e22;
+  --tv-ink-secondary: #5a5a64;
+  --tv-ink-tertiary: #8e8e98;
+  --tv-accent: #3a7070;
+  --tv-accent-wash: rgba(58, 112, 112, 0.08);
+}
+
+.kenban-scope .tv-panel ::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.kenban-scope .tv-panel ::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.22);
+}

@@ -1,0 +1,112 @@
+/* ============================================
+   KENBAN App Styles
+   ============================================ */
+
+:root {
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* --- Fullscreen flash animation --- */
+@keyframes fullscreen-flash {
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.fullscreen-flash-overlay {
+  position: fixed;
+  inset: 0;
+  background-color: #000;
+  z-index: 9998;
+  pointer-events: none;
+  animation: fullscreen-flash 0.25s ease-out forwards;
+}
+
+/* --- Fullscreen exit hint --- */
+.fullscreen-hint-container {
+  position: fixed;
+  top: 40px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-20px);
+  z-index: 10000;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.4s ease, transform 0.4s ease;
+}
+
+.fullscreen-hint-container.visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.fullscreen-hint-container .fullscreen-hint {
+  background-color: rgba(236, 236, 240, 0.95);
+  color: #1c1c22;
+  padding: 16px 32px;
+  border-radius: 12px;
+  font-size: 24px;
+  font-weight: 500;
+  white-space: nowrap;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+}
+
+/* --- Fullscreen close button --- */
+.fullscreen-close-btn {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 10001;
+  width: 44px;
+  height: 44px;
+  background: rgba(236, 236, 240, 0.9);
+  border: none;
+  border-radius: 50%;
+  color: #1c1c22;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  visibility: hidden;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+  transition: opacity 0.3s ease, visibility 0.3s ease, background-color 0.2s ease, transform 0.2s ease;
+}
+
+.fullscreen-close-btn svg {
+  stroke: #1c1c22;
+  width: 20px;
+  height: 20px;
+}
+
+.fullscreen-close-btn.show {
+  opacity: 1;
+  visibility: visible;
+}
+
+.fullscreen-close-btn:hover {
+  background: rgba(196, 124, 124, 0.95);
+}
+
+.fullscreen-close-btn:hover svg {
+  stroke: #fff;
+}
+
+.fullscreen-close-btn:active {
+  transform: scale(0.95);
+}
+
+/* --- Fullscreen zoom target --- */
+.fullscreen-zoom-target {
+  transform-origin: center center;
+  will-change: transform;
+}
