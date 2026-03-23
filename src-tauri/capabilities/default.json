@@ -16,7 +16,6 @@
       "identifier": "fs:scope",
       "allow": [{ "path": "**" }]
     },
-    "opener:default",
     "dialog:default",
     "dialog:allow-open",
     "dialog:allow-save",
