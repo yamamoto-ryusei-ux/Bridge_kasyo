@@ -1,19 +1,21 @@
-# COMIC-Bridge (manga-psd-manager)
+# COMIC-Bridge + KENBAN統合版 (Bridge_kasyo)
 
-漫画入稿データ（PSD）の確認・調整を行うデスクトップアプリケーション
+漫画入稿データ（PSD）の確認・調整 + ビジュアル差分検版を行うデスクトップアプリケーション
 
 ## 概要
 
 漫画制作者や編集者が入稿前にPSDファイルの仕様をチェックし、必要に応じてPhotoshopと連携して一括修正できるツール。
+**KENBAN（検版ツール）をタブとして統合**し、TIFF/PSD/PDF画像の差分検出・テキスト照合もアプリ内で完結。
 
 ## 技術スタック
 
 - **フレームワーク**: Tauri 2.0
 - **フロントエンド**: React 18 + TypeScript + Vite
-- **スタイリング**: Tailwind CSS
-- **状態管理**: Zustand
-- **PSD処理**: ag-psd（読み取り専用）、Photoshop ExtendScript（変換・書き込み）
-- **PDF処理**: pdfium-render（プレビュー/サムネイル）、Photoshop PDFOpenOptions（分割処理）
+- **スタイリング**: Tailwind CSS 3（KENBAN部分はCSS変数スコープ `.kenban-scope`）
+- **状態管理**: Zustand（COMIC-Bridge側）、React useState（KENBAN側）
+- **PSD処理**: ag-psd（読み取り専用）、Photoshop ExtendScript（変換・書き込み）、psd crate + フォールバックパーサー（KENBAN側）
+- **PDF処理**: pdfium-render（プレビュー/サムネイル/差分計算）、pdfjs-dist（フロントエンドPDF表示）、pdf-lib/jsPDF（最適化/生成）
+- **画像差分**: rayon並列ピクセル差分、ヒートマップ、Union-Findクラスタリング（Rust）
 - **バックエンド**: Rust
 
 ## 設計思想
@@ -357,11 +359,83 @@
 **フォルダ検出** (`detect_psd_folders` Rustコマンド):
 - 指定フォルダ内のPSDファイルを含むサブフォルダを検出
 
+### 20. 検版（KENBAN統合）
+- **概要**: KENBANアプリを10番目のタブ「検版」としてCOMIC-Bridgeに統合。2つの画像ファイル（TIFF/PSD/PDF）を比較して差分を検出する検版支援機能
+- **元リポジトリ**: https://github.com/Takumi-2222/KENBAN (v2.2.16)
+- **統合方式**: KenbanApp（元App.tsx）を自己完結型コンポーネントとしてタブ内に描画。状態はReact useStateで管理（タブ切替時もアンマウントしない＝状態保持）
+- **UIスコープ**: `.kenban-scope` CSS変数でダークテーマを分離（COMIC-Bridgeのライトテーマと干渉しない）
+- **Rustバックエンド**: `kenban.rs` モジュールとして統合。コマンド名はCOMIC-Bridgeと重複するものを `kenban_` プレフィックス付きでリネーム
+
+**比較モード:**
+- **TIFF-TIFF**: TIFF同士のピクセル差分（rayon並列、閾値設定可）
+- **PSD-PSD**: PSD同士の差分（フォールバックパーサー付き堅牢デコード）
+- **PDF-PDF**: PDFページ単位の差分（PDFiumレンダリング + rayon並列）
+- **PSD-TIFF（混合）**: PSD→TIFF出力の検証（ヒートマップ差分、クロップ範囲指定）
+- **テキスト照合**: PSDテキストレイヤーとメモテキストの写植照合（LCS+ファジーマッチ）
+
+**主要機能:**
+- 差分マーカー（Union-Findクラスタリングで差分領域を自動検出・円形マーカー表示）
+- 並列ビューア（同期/非同期サイドバイサイド表示、PDF見開きモード）
+- スクリーンショット指示エディタ（矩形・ペン・テキスト・リーダー線注釈、PNG保存）
+- MojiQ連携（PDFをMojiQアプリで開く）
+- Photoshop連携（PキーでPhotoshopで開く）
+- Google Driveフォルダブラウザ
+- イースターエッグ（初期画面で"kenpan"入力でロゴ変更）
+
+**フロントエンド構成（`src/components/kenban/`）:**
+- `KenbanApp.tsx` — メインコンテナ（全状態管理、〜4000行）
+- `KenbanHeader.tsx` — ヘッダーバー
+- `KenbanSidebar.tsx` — サイドバー（モード切替、ファイルリスト、設定）
+- `DiffViewer.tsx` — 差分ビューア（ツールバー、ドロップゾーン、画像表示）
+- `ParallelViewer.tsx` — 並列ビューア（サイドバイサイド比較）
+- `TextVerifyViewer.tsx` — テキスト照合ビューア（PSD↔メモ差分、統合/分割/画像ビュー）
+- `ScreenshotEditor.tsx` — スクリーンショット指示エディタ
+- `GDriveFolderBrowser.tsx` — Google Driveブラウザモーダル
+
+**ユーティリティ（`src/kenban-utils/`）:**
+- `textExtract.ts` — PSDテキスト抽出、行セットマッチング、LCS差分計算
+- `pdf.ts` — PDF.jsキャッシュ、pdf-lib最適化、WASM設定
+- `memoParser.ts` — メモテキスト解析（ページ分割、`<<X,YPage>>`パターン）
+- `kenbanTypes.ts` — KENBAN専用TypeScript型定義
+- `kenban.css` — ダークテーマCSS変数（`.kenban-scope`スコープ）
+- `kenbanApp.css` — フルスクリーンアニメーション
+
+**Rustコマンド（`kenban.rs` — 19コマンド）:**
+| コマンド | 用途 |
+|---------|------|
+| `kenban_parse_psd` | PSD合成画像デコード（フォールバックパーサー付き） |
+| `decode_and_resize_image` | 画像デコード+リサイズ（3層キャッシュ） |
+| `preload_images` | rayon並列画像プリロード |
+| `clear_image_cache` | メモリキャッシュクリア |
+| `compute_diff_simple` | TIFF/PSD差分計算（ピクセル比較+マーカー） |
+| `compute_diff_heatmap` | PSD-TIFF ヒートマップ差分 |
+| `check_diff_simple` | 軽量差分チェック（画像エンコードなし） |
+| `check_diff_heatmap` | 軽量ヒートマップチェック |
+| `compute_pdf_diff` | PDF-PDF差分計算（PDFiumレンダリング） |
+| `kenban_render_pdf_page` | PDFページレンダリング（見開き分割対応） |
+| `kenban_get_pdf_page_count` | PDF総ページ数取得 |
+| `kenban_list_files_in_folder` | フォルダ内ファイル一覧（自然順ソート） |
+| `kenban_open_file_in_photoshop` | Photoshopでファイルを開く |
+| `kenban_open_file_with_default_app` | デフォルトアプリで開く |
+| `kenban_save_screenshot` | スクリーンショットPNG保存 |
+| `kenban_open_folder` | エクスプローラーでフォルダを開く |
+| `open_pdf_in_mojiq` | MojiQでPDFを開く |
+| `get_cli_args` | CLI引数取得 |
+| `kenban_cleanup_preview_cache` | プレビューキャッシュクリーンアップ |
+
+**KENBAN統合時の注意事項:**
+- KenbanAppは`@ts-nocheck`付き（React 19→18の型非互換性回避）
+- `onCloseRequested`は無効化済み（タブ埋め込みのためウィンドウクローズをブロックしない）
+- タブ切替時のアンマウント防止: ViewRouterで`display: none/contents`切替（状態保持）
+- invokeコマンド名: COMIC-Bridgeと重複するコマンドは`kenban_`プレフィックス付き
+- pdfium.dll探索パス: `CARGO_MANIFEST_DIR/resources/pdfium/` → exe隣 → `resources/pdfium/` → システム
+- CSPに`worker-src blob:`, `script-src blob:`が必要（pdfjs-dist Web Worker用）
+
 ## UI構成
 
 ### レイアウト
-- **TopNav**: 上部ナビゲーション。タブでビュー切替（完成原稿チェック/レイヤー制御/写植関連/差替え/合成/TIFF化/スキャナー/見開き分割/リネーム）
-- **ViewRouter + viewStore**: タブベースのビュー切替管理（AppView: specCheck | layers | typesetting | split | replace | compose | rename | tiff | scanPsd）
+- **TopNav**: 上部ナビゲーション。タブでビュー切替（完成原稿チェック/レイヤー制御/写植関連/差替え/合成/TIFF化/スキャナー/見開き分割/リネーム/検版）
+- **ViewRouter + viewStore**: タブベースのビュー切替管理（AppView: specCheck | layers | typesetting | split | replace | compose | rename | tiff | scanPsd | kenban）。KenbanViewのみdisplay切替で状態保持
 - **AppLayout**: TopNav + フルワイドビュー構成（旧3カラムサイドバーは廃止済み）、グローバルD&Dリスナー（useGlobalDragDrop）。`handleMouseDown`で領域外クリック時に選択解除（モーダルは`onMouseDown stopPropagation`で保護が必要）
 
 ### ビュー
@@ -445,7 +519,8 @@ src/
 │   │   ├── SplitView.tsx         # 見開き分割ビュー
 │   │   ├── RenameView.tsx        # リネームビュー（fileEntries→psdStore自動同期）
 │   │   ├── TiffView.tsx          # TIFF化ビュー（3カラム: FileList|Center|Settings）
-│   │   └── ScanPsdView.tsx      # Scan PSDビュー（ScanPsdPanel + ScanPsdContent）
+│   │   ├── ScanPsdView.tsx      # Scan PSDビュー（ScanPsdPanel + ScanPsdContent）
+│   │   └── KenbanView.tsx       # 検版ビュー（KenbanAppラッパー、状態保持）
 │   ├── metadata/          # メタデータ表示
 │   │   ├── MetadataPanel.tsx
 │   │   └── LayerTree.tsx
@@ -514,6 +589,15 @@ src/
 │   │   ├── TiffResultDialog.tsx         # 処理結果ダイアログ
 │   │   ├── TiffSettingsPanel.tsx        # 左パネル設定UI（折りたたみセクション: 出力形式/カラーぼかし/クロップ・リサイズ/リネーム・出力先）
 │   │   └── TiffViewerPanel.tsx          # TIFF化ビューアーパネル（プレビュー表示）
+│   ├── kenban/            # 検版（KENBAN統合）
+│   │   ├── KenbanApp.tsx          # メインコンテナ（全状態管理、@ts-nocheck）
+│   │   ├── KenbanHeader.tsx       # ヘッダーバー
+│   │   ├── KenbanSidebar.tsx      # サイドバー（モード切替、ファイルリスト）
+│   │   ├── DiffViewer.tsx         # 差分ビューア
+│   │   ├── ParallelViewer.tsx     # 並列ビューア
+│   │   ├── TextVerifyViewer.tsx   # テキスト照合ビューア
+│   │   ├── ScreenshotEditor.tsx   # スクリーンショット指示エディタ
+│   │   └── GDriveFolderBrowser.tsx # Google Driveブラウザモーダル
 │   ├── scanPsd/           # Scan PSD（フォントプリセット管理）
 │   │   ├── ScanPsdPanel.tsx          # 左パネル（5タブ + 保存ボタン）
 │   │   ├── ScanPsdContent.tsx        # 右パネル（モード選択/スキャンUI/サマリー/ファイルブラウザ）
@@ -585,6 +669,21 @@ src/
 │   ├── tiffStore.ts       # TIFF化設定・状態（settings, fileOverrides, cropPresets, cropGuides, phase, results）。localStorage永続化（crop.bounds除く）
 │   ├── scanPsdStore.ts    # Scan PSD（mode, scanData, presetSets, workInfo, guide選択/除外, パス設定）。パスのみlocalStorage永続化
 │   └── typesettingCheckStore.ts  # 写植チェック（checkData, checkTabMode, searchQuery, navigateToPage）
+├── kenban-utils/          # KENBAN専用ユーティリティ
+│   ├── textExtract.ts         # PSDテキスト抽出、行セットマッチング、LCS差分
+│   ├── pdf.ts                 # PDF.jsキャッシュ、pdf-lib最適化
+│   ├── memoParser.ts          # メモテキスト解析
+│   ├── kenbanTypes.ts         # KENBAN専用型定義
+│   ├── kenban.css             # ダークテーマCSS変数（.kenban-scope）
+│   ├── kenbanApp.css          # フルスクリーンアニメーション
+│   ├── utif.d.ts              # UTIFモジュール型宣言
+│   └── assets.d.ts            # PNG/SVGモジュール型宣言
+├── kenban-hooks/          # KENBAN専用フック
+│   └── useTextExtractWorker.ts # Web Workerラッパー（PSDテキスト抽出+diff）
+├── kenban-workers/        # KENBAN専用Web Worker
+│   └── textExtractWorker.ts    # PSDテキスト抽出Worker
+├── kenban-assets/         # KENBAN専用アセット
+│   └── kenpan_logo.png        # アプリロゴ（イースターエッグ用）
 ├── styles/
 │   └── globals.css
 └── types/
@@ -621,8 +720,9 @@ src-tauri/
 ├── build.rs               # ビルドスクリプト
 └── src/
     ├── main.rs            # Tauriエントリポイント
-    ├── lib.rs             # コマンド登録（invoke_handler）
-    ├── commands.rs        # 全Tauriコマンド
+    ├── lib.rs             # コマンド登録（invoke_handler）— COMIC-Bridge + KENBANコマンド統合
+    ├── commands.rs        # COMIC-Bridge Tauriコマンド（55コマンド）
+    ├── kenban.rs          # KENBAN Tauriコマンド（19コマンド）— 画像差分、PSD/PDF処理、キャッシュ
     ├── pdf.rs             # PDFレンダリング内部ヘルパー（pdfium-render）
     ├── psd_metadata.rs    # PSDメタデータ抽出ユーティリティ
     └── watcher.rs         # ファイル変更監視（外部ファイル変更検出）
@@ -939,11 +1039,13 @@ warning: "#f59e0b"       // オレンジ
 - Tailwind CSS 3.4.15、Vite 5.4.0、TypeScript
 - @tauri-apps/api 2.0.0
 - Tauriプラグイン: dialog, fs, process, updater
+- **KENBAN追加**: lucide-react 0.562.0、diff 8.0.3、pdfjs-dist 5.4.530、pdf-lib 1.17.1、jspdf 4.0.0、utif 3.1.0
 
 ### Rust
 - tauri 2.0、tokio（非同期ランタイム）、serde（シリアライズ）
 - pdfium-render（PDF処理）、fontdb + ttf-parser（フォント解決）
-- image（画像処理）
+- image（画像処理、tiff/png/jpeg features）
+- **KENBAN追加**: psd 0.3（PSDデコード）、rayon 1.10（並列処理）、base64 0.22、open 5、dirs 5、natord 1.0
 
 ## 開発コマンド
 
