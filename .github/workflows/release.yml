@@ -46,7 +46,7 @@ jobs:
           Remove-Item pdfium.tgz -Force
 
       - name: Install frontend dependencies
-        run: npm install
+        run: npm install --legacy-peer-deps
 
       - name: Build the app
         uses: tauri-apps/tauri-action@v0.5
