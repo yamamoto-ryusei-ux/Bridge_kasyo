@@ -1582,20 +1582,41 @@ pub fn check_diff_heatmap(
 
 // ============== PDF差分計算 (PDFium) ==============
 
-/// PDFiumライブラリのバインディングを取得
+/// PDFiumライブラリを探索してバインディングを取得
+/// 探索順: 1. CARGO_MANIFEST_DIR/resources/pdfium/ (dev)  2. exe隣  3. exe隣/resources/pdfium/  4. システム
 pub fn get_pdfium() -> Result<Pdfium, String> {
-    // 実行ファイルと同じディレクトリからpdfium.dllを探す
-    let exe_dir = std::env::current_exe()
-        .map_err(|e| format!("Failed to get exe path: {}", e))?
-        .parent()
-        .ok_or_else(|| "Failed to get exe directory".to_string())?
-        .to_path_buf();
+    // 1. Dev: CARGO_MANIFEST_DIR/resources/pdfium/
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let dll_path = std::path::Path::new(&manifest_dir).join("resources").join("pdfium").join("pdfium.dll");
+        if dll_path.exists() {
+            let bindings = Pdfium::bind_to_library(dll_path.to_string_lossy().to_string())
+                .map_err(|e| format!("Failed to load PDFium: {:?}", e))?;
+            return Ok(Pdfium::new(bindings));
+        }
+    }
 
-    let bindings = Pdfium::bind_to_library(
-        Pdfium::pdfium_platform_library_name_at_path(&exe_dir)
-    ).or_else(|_| Pdfium::bind_to_system_library())
-        .map_err(|e| format!("Failed to load PDFium library: {}. Place pdfium.dll next to the executable.", e))?;
+    // 2. exe隣
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let dll_path = exe_dir.join("pdfium.dll");
+            if dll_path.exists() {
+                let bindings = Pdfium::bind_to_library(dll_path.to_string_lossy().to_string())
+                    .map_err(|e| format!("Failed to load PDFium: {:?}", e))?;
+                return Ok(Pdfium::new(bindings));
+            }
+            // 3. exe隣/resources/pdfium/
+            let dll_path = exe_dir.join("resources").join("pdfium").join("pdfium.dll");
+            if dll_path.exists() {
+                let bindings = Pdfium::bind_to_library(dll_path.to_string_lossy().to_string())
+                    .map_err(|e| format!("Failed to load PDFium: {:?}", e))?;
+                return Ok(Pdfium::new(bindings));
+            }
+        }
+    }
 
+    // 4. システムライブラリ
+    let bindings = Pdfium::bind_to_system_library()
+        .map_err(|e| format!("PDFium library not found: {:?}", e))?;
     Ok(Pdfium::new(bindings))
 }
 
