@@ -56,9 +56,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'Comic-Bridge ${{ github.ref_name }}'
+          releaseName: 'Comic-Bridge_kasyo ${{ github.ref_name }}'
           releaseBody: |
-            ## Comic-Bridge ${{ github.ref_name }}
+            ## Comic-Bridge_kasyo ${{ github.ref_name }}
 
             ### インストール方法
             1. `Comic-Bridge_x.x.x_x64-setup.exe` をダウンロード
