@@ -3667,7 +3667,7 @@ export default function MangaDiffDetector() {
   }, []);
 
   return (
-    <div className="h-screen flex flex-col bg-neutral-900 text-white font-sans select-none fullscreen-zoom-target">
+    <div className="h-full w-full flex flex-col bg-neutral-900 text-white font-sans select-none fullscreen-zoom-target">
       {/* PDF最適化進捗オーバーレイ（MojiQと同じスタイル） */}
       {optimizeProgress && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
