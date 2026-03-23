@@ -332,7 +332,7 @@ export default function MangaDiffDetector() {
           filePathsA = jsonData.filesA;
         } else {
           const extensionsA = mode === 'psd-psd' || mode === 'psd-tiff' ? ['psd', 'psb'] : ['tif', 'tiff', 'jpg', 'jpeg'];
-          filePathsA = await invoke<string[]>('list_files_in_folder', {
+          filePathsA = await invoke<string[]>('kenban_list_files_in_folder', {
             path: folderA, extensions: extensionsA,
           });
         }
@@ -341,7 +341,7 @@ export default function MangaDiffDetector() {
           filePathsB = jsonData.filesB;
         } else {
           const extensionsB = mode === 'psd-tiff' ? ['tif', 'tiff', 'jpg', 'jpeg'] : (mode === 'psd-psd' ? ['psd', 'psb'] : ['tif', 'tiff', 'jpg', 'jpeg']);
-          filePathsB = await invoke<string[]>('list_files_in_folder', {
+          filePathsB = await invoke<string[]>('kenban_list_files_in_folder', {
             path: folderB, extensions: extensionsB,
           });
         }
@@ -460,7 +460,7 @@ export default function MangaDiffDetector() {
     (async () => {
       const [resultA, resultB] = await Promise.all([
         needA
-          ? invoke<{ src: string; width: number; height: number }>('render_pdf_page', {
+          ? invoke<{ src: string; width: number; height: number }>('kenban_render_pdf_page', {
               path: entryA.path,
               page: entryA.pdfPage! - 1,
               dpi: 300.0,
@@ -468,7 +468,7 @@ export default function MangaDiffDetector() {
             }).catch(err => { console.error('PDF render A error:', err); return null; })
           : Promise.resolve(null),
         needB
-          ? invoke<{ src: string; width: number; height: number }>('render_pdf_page', {
+          ? invoke<{ src: string; width: number; height: number }>('kenban_render_pdf_page', {
               path: entryB.path,
               page: entryB.pdfPage! - 1,
               dpi: 300.0,
@@ -832,7 +832,7 @@ export default function MangaDiffDetector() {
                 // ファイルの場合、親フォルダを使用
                 folderPath = firstPath.replace(/[/\\][^/\\]+$/, '');
               }
-              const files = await invoke<string[]>('list_files_in_folder', {
+              const files = await invoke<string[]>('kenban_list_files_in_folder', {
                 path: folderPath,
                 extensions: ['psd'],
               });
@@ -1172,7 +1172,7 @@ export default function MangaDiffDetector() {
         setDiffFolderA(selected);
 
         // Rustでファイル一覧を取得
-        const filePaths = await invoke<string[]>('list_files_in_folder', {
+        const filePaths = await invoke<string[]>('kenban_list_files_in_folder', {
           path: selected,
           extensions,
         });
@@ -1228,7 +1228,7 @@ export default function MangaDiffDetector() {
         setDiffFolderB(selected);
 
         // Rustでファイル一覧を取得
-        const filePaths = await invoke<string[]>('list_files_in_folder', {
+        const filePaths = await invoke<string[]>('kenban_list_files_in_folder', {
           path: selected,
           extensions,
         });
@@ -1376,8 +1376,8 @@ export default function MangaDiffDetector() {
 
         // ページ数を取得
         const [countA, countB] = await Promise.all([
-          invoke<number>('get_pdf_page_count', { path: pathA }),
-          invoke<number>('get_pdf_page_count', { path: pathB })
+          invoke<number>('kenban_get_pdf_page_count', { path: pathA }),
+          invoke<number>('kenban_get_pdf_page_count', { path: pathB })
         ]);
         if (compareModeRef.current !== startMode) return;
 
@@ -1898,7 +1898,7 @@ export default function MangaDiffDetector() {
 
       if (selected && typeof selected === 'string') {
         // Rustでファイル一覧を取得
-        const files = await invoke<string[]>('list_files_in_folder', {
+        const files = await invoke<string[]>('kenban_list_files_in_folder', {
           path: selected,
           extensions: ['tif', 'tiff', 'psd', 'png', 'jpg', 'jpeg', 'pdf'],
         });
@@ -1951,7 +1951,7 @@ export default function MangaDiffDetector() {
       const fileName = pdfPath.split(/[/\\]/).pop() || 'PDF';
 
       // PDFページ数をRust PDFium経由で取得
-      const numPages = await invoke<number>('get_pdf_page_count', { path: pdfPath });
+      const numPages = await invoke<number>('kenban_get_pdf_page_count', { path: pdfPath });
 
       // 各ページをエントリとして展開
       const entries: ParallelFileEntry[] = [];
@@ -2084,7 +2084,7 @@ export default function MangaDiffDetector() {
   // フォルダをエントリに展開
   const expandFolderToParallelEntries = async (folderPath: string, side: 'A' | 'B') => {
     try {
-      const files = await invoke<string[]>('list_files_in_folder', {
+      const files = await invoke<string[]>('kenban_list_files_in_folder', {
         path: folderPath,
         extensions: ['tif', 'tiff', 'psd', 'png', 'jpg', 'jpeg', 'pdf'],
       });
@@ -2219,7 +2219,7 @@ export default function MangaDiffDetector() {
         return dataUrl;
       } else if (entry.type === 'psd') {
         // PSDはRust側で処理 → tempファイルパスが返る
-        const result = await invoke<{ file_url: string; width: number; height: number }>('parse_psd', { path: entry.path });
+        const result = await invoke<{ file_url: string; width: number; height: number }>('kenban_parse_psd', { path: entry.path });
         const assetUrl = convertFileSrc(result.file_url);
         setParallelImageCache(prev => ({
           ...prev,
@@ -2316,7 +2316,7 @@ export default function MangaDiffDetector() {
       const key = `${pdfEntry.path}:${pdfEntry.page}:${pdfEntry.splitSide || ''}`;
       if (pdfUrlCacheRef.current[key]) continue; // 既にキャッシュ済み
 
-      invoke<{ src: string; width: number; height: number }>('render_pdf_page', {
+      invoke<{ src: string; width: number; height: number }>('kenban_render_pdf_page', {
         path: pdfEntry.path,
         page: pdfEntry.page,
         dpi: 300.0,
@@ -2336,7 +2336,7 @@ export default function MangaDiffDetector() {
 
       (async () => {
         try {
-          const result = await invoke<{ file_url: string; width: number; height: number }>('parse_psd', { path });
+          const result = await invoke<{ file_url: string; width: number; height: number }>('kenban_parse_psd', { path });
           const assetUrl = convertFileSrc(result.file_url);
           setParallelImageCache(prev => ({
             ...prev,
@@ -2400,7 +2400,7 @@ export default function MangaDiffDetector() {
 
         await Promise.all(batch.map(async (entry) => {
           try {
-            const result = await invoke<{ src: string; width: number; height: number }>('render_pdf_page', {
+            const result = await invoke<{ src: string; width: number; height: number }>('kenban_render_pdf_page', {
               path: entry.path,
               page: entry.page,
               dpi: 300.0,
@@ -2461,7 +2461,7 @@ export default function MangaDiffDetector() {
     try {
       // フォルダAを再スキャン
       if (diffFolderA) {
-        const filePathsA = await invoke<string[]>('list_files_in_folder', {
+        const filePathsA = await invoke<string[]>('kenban_list_files_in_folder', {
           path: diffFolderA,
           extensions: extensionsA,
         });
@@ -2472,7 +2472,7 @@ export default function MangaDiffDetector() {
 
       // フォルダBを再スキャン
       if (diffFolderB) {
-        const filePathsB = await invoke<string[]>('list_files_in_folder', {
+        const filePathsB = await invoke<string[]>('kenban_list_files_in_folder', {
           path: diffFolderB,
           extensions: extensionsB,
         });
@@ -2546,7 +2546,7 @@ export default function MangaDiffDetector() {
       });
       if (!selected || typeof selected !== 'string') return;
 
-      const files = await invoke<string[]>('list_files_in_folder', {
+      const files = await invoke<string[]>('kenban_list_files_in_folder', {
         path: selected,
         extensions: ['psd'],
       });
@@ -2960,7 +2960,7 @@ export default function MangaDiffDetector() {
     const page = textVerifyPagesRef.current[idx];
     if (!page || page.imageSrc || page.status !== 'done') return false;
     try {
-      const result = await invoke<{ file_url: string; width: number; height: number }>('parse_psd', { path: page.filePath });
+      const result = await invoke<{ file_url: string; width: number; height: number }>('kenban_parse_psd', { path: page.filePath });
       const assetUrl = convertFileSrc(result.file_url);
       setTextVerifyPages(prev => prev.map((p, i) =>
         i === idx ? { ...p, imageSrc: assetUrl } : p
